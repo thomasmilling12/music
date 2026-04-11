@@ -135,9 +135,14 @@ def queue_total_duration(q: GuildQueue) -> str:
 # ---------------------------------------------------------------------------
 
 def has_dj_role(member: discord.Member) -> bool:
+    # Server owner and admins always bypass the DJ check
+    if member.guild.owner_id == member.id:
+        return True
+    if member.guild_permissions.administrator:
+        return True
     role = discord.utils.get(member.guild.roles, name=DJ_ROLE_NAME)
     if role is None:
-        return True
+        return True   # DJ role not configured — allow everyone
     return role in member.roles
 
 
@@ -611,6 +616,13 @@ async def _start_playing(guild: discord.Guild, q: GuildQueue, seek_secs: int = 0
     def after_play(error):
         if error:
             print(f"[Player] Error: {error}")
+            err_str = str(error)
+            # Voice session invalidated (4006) or closed — clean up and stop
+            if "4006" in err_str or "ConnectionClosed" in type(error).__name__:
+                asyncio.run_coroutine_threadsafe(
+                    _handle_voice_drop(guild), guild._state.loop
+                )
+                return
         asyncio.run_coroutine_threadsafe(_play_next(guild), guild._state.loop)
 
     q.voice_client.play(source, after=after_play)
@@ -672,6 +684,35 @@ async def _play_next(guild: discord.Guild) -> None:
 
     q.current = q.tracks.popleft()
     await _start_playing(guild, q)
+
+
+async def _handle_voice_drop(guild: discord.Guild) -> None:
+    """Called when the voice WebSocket is closed unexpectedly (e.g. error 4006)."""
+    q = queues.get(guild.id)
+    if not q:
+        return
+    print(f"[Voice] Session dropped in {guild.name} — cleaning up")
+    if q.np_update_task:
+        q.np_update_task.cancel()
+        q.np_update_task = None
+    if q.idle_task:
+        q.idle_task.cancel()
+        q.idle_task = None
+    # Don't wipe the queue — user can /play again to resume
+    q.current = None
+    q.play_start = None
+    q.np_message = None
+    try:
+        await guild._state.client.change_presence(activity=None)
+    except Exception:
+        pass
+    if q.text_channel:
+        try:
+            await q.text_channel.send(
+                "⚠️ Voice connection dropped. Use `/play` to resume."
+            )
+        except Exception:
+            pass
 
 
 async def _idle_disconnect(guild: discord.Guild) -> None:
@@ -776,7 +817,14 @@ async def ensure_voice(interaction: discord.Interaction) -> Optional[GuildQueue]
     channel = interaction.user.voice.channel
 
     existing_vc = interaction.guild.voice_client
-    if not existing_vc or not existing_vc.is_connected():
+    # Force reconnect if: no vc, not connected, or connected but broken (not playing and in wrong channel)
+    needs_connect = (
+        not existing_vc
+        or not existing_vc.is_connected()
+        or (existing_vc.channel and existing_vc.channel != channel
+            and not existing_vc.is_playing() and not existing_vc.is_paused())
+    )
+    if needs_connect:
         if existing_vc:
             try:
                 await asyncio.wait_for(existing_vc.disconnect(force=True), timeout=5)
