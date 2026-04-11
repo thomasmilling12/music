@@ -16,6 +16,7 @@ load_dotenv()
 
 TOKEN = os.getenv("DISCORD_TOKEN")
 MUSIC_CHANNEL_ID = int(os.getenv("MUSIC_CHANNEL_ID", "1487195424111726743"))
+GUILD_ID = 850386896509337710
 DJ_ROLE_NAME = os.getenv("DJ_ROLE_NAME", "DJ")
 SONG_LIMIT = int(os.getenv("SONG_LIMIT_PER_USER", "5"))   # 0 = unlimited
 IDLE_TIMEOUT = 300
@@ -614,8 +615,10 @@ class MusicBot(commands.Bot):
         super().__init__(command_prefix="!", intents=intents)
 
     async def setup_hook(self):
-        await self.tree.sync()
-        print("📡 Slash commands synced globally")
+        guild = discord.Object(id=GUILD_ID)
+        self.tree.copy_global_to(guild=guild)
+        await self.tree.sync(guild=guild)
+        print(f"📡 Slash commands synced to guild {GUILD_ID}")
 
     async def on_ready(self):
         print(f"🤖 Logged in as {self.user}")
