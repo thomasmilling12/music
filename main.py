@@ -769,8 +769,9 @@ def dj_only():
 
 
 async def ensure_voice(interaction: discord.Interaction) -> Optional[GuildQueue]:
+    # All callers already called defer(), so we must use followup — never response.send_message
     if not interaction.user.voice or not interaction.user.voice.channel:
-        await interaction.response.send_message("❌ You need to be in a voice channel first.", ephemeral=True)
+        await interaction.followup.send("❌ You need to be in a voice channel first.", ephemeral=True)
         return None
 
     q       = get_queue(interaction.guild_id)
@@ -779,11 +780,17 @@ async def ensure_voice(interaction: discord.Interaction) -> Optional[GuildQueue]
     existing_vc = interaction.guild.voice_client
     if not existing_vc or not existing_vc.is_connected():
         if existing_vc:
-            try: await existing_vc.disconnect(force=True)
-            except Exception: pass
+            try:
+                await asyncio.wait_for(existing_vc.disconnect(force=True), timeout=5)
+            except Exception:
+                pass
         try:
-            vc = await channel.connect(timeout=30.0, reconnect=True)
+            vc = await asyncio.wait_for(channel.connect(reconnect=True), timeout=20)
             q.voice_client = vc
+        except asyncio.TimeoutError:
+            print("[Voice] connect() timed out")
+            await interaction.followup.send("❌ Took too long to join the voice channel. Try again.", ephemeral=True)
+            return None
         except Exception as e:
             print(f"[Voice] Failed to connect: {e}")
             await interaction.followup.send("❌ Couldn't connect to your voice channel. Try again.", ephemeral=True)
@@ -839,49 +846,57 @@ async def _search_suggestions(current: str) -> list[app_commands.Choice[str]]:
 @music_channel_only()
 async def cmd_play(interaction: discord.Interaction, query: str):
     await interaction.response.defer()
-    q = await ensure_voice(interaction)
-    if q is None: return
+    try:
+        q = await ensure_voice(interaction)
+        if q is None: return
 
-    uid = interaction.user.id
-    if SONG_LIMIT > 0 and user_song_count(q, uid) >= SONG_LIMIT:
-        await interaction.followup.send(
-            f"❌ You already have **{SONG_LIMIT}** songs queued. Wait for one to finish.", ephemeral=True); return
+        uid = interaction.user.id
+        if SONG_LIMIT > 0 and user_song_count(q, uid) >= SONG_LIMIT:
+            await interaction.followup.send(
+                f"❌ You already have **{SONG_LIMIT}** songs queued. Wait for one to finish.", ephemeral=True); return
 
-    is_playlist = ("list=" in query) and (query.startswith("http://") or query.startswith("https://"))
+        is_playlist = ("list=" in query) and (query.startswith("http://") or query.startswith("https://"))
 
-    if is_playlist:
-        tracks = await fetch_playlist(query, str(interaction.user), uid)
-        if not tracks:
-            await interaction.followup.send("❌ Couldn't load that playlist."); return
-        start_now = q.current is None and not q.voice_client.is_playing()
-        for t in tracks: q.tracks.append(t)
-        if start_now and q.tracks:
-            q.current = q.tracks.popleft()
+        if is_playlist:
+            tracks = await fetch_playlist(query, str(interaction.user), uid)
+            if not tracks:
+                await interaction.followup.send("❌ Couldn't load that playlist."); return
+            start_now = q.current is None and not q.voice_client.is_playing()
+            for t in tracks: q.tracks.append(t)
+            if start_now and q.tracks:
+                q.current = q.tracks.popleft()
+                await _start_playing(interaction.guild, q)
+            await interaction.followup.send(
+                f"{'▶️ Starting' if start_now else '➕ Added'} **{len(tracks)} songs** from the playlist.")
+            return
+
+        track = await fetch_track(query, str(interaction.user), uid)
+        if track is None:
+            await interaction.followup.send("❌ Could not find that song. Try a different search."); return
+        if isinstance(track, str):
+            await interaction.followup.send(track); return
+
+        if q.voice_client.is_playing() or q.voice_client.is_paused() or q.current is not None:
+            q.tracks.append(track)
+            embed = discord.Embed(title="➕ Added to Queue",
+                                  description=f"**[{track.title}]({track.webpage_url})**",
+                                  color=0x5865F2)
+            embed.add_field(name="Duration",     value=track.duration,         inline=True)
+            embed.add_field(name="Position",     value=str(len(q.tracks)),     inline=True)
+            embed.add_field(name="Requested by", value=track.requested_by,     inline=True)
+            if track.thumbnail: embed.set_thumbnail(url=track.thumbnail)
+            await interaction.followup.send(embed=embed)
+        else:
+            q.current = track
             await _start_playing(interaction.guild, q)
-        await interaction.followup.send(
-            f"{'▶️ Starting' if start_now else '➕ Added'} **{len(tracks)} songs** from the playlist.")
-        return
+            await interaction.followup.send("▶️ Starting playback…")
 
-    track = await fetch_track(query, str(interaction.user), uid)
-    if track is None:
-        await interaction.followup.send("❌ Could not find that song. Try a different search."); return
-    if isinstance(track, str):
-        await interaction.followup.send(track); return
-
-    if q.voice_client.is_playing() or q.voice_client.is_paused() or q.current is not None:
-        q.tracks.append(track)
-        embed = discord.Embed(title="➕ Added to Queue",
-                              description=f"**[{track.title}]({track.webpage_url})**",
-                              color=0x5865F2)
-        embed.add_field(name="Duration",     value=track.duration,         inline=True)
-        embed.add_field(name="Position",     value=str(len(q.tracks)),     inline=True)
-        embed.add_field(name="Requested by", value=track.requested_by,     inline=True)
-        if track.thumbnail: embed.set_thumbnail(url=track.thumbnail)
-        await interaction.followup.send(embed=embed)
-    else:
-        q.current = track
-        await _start_playing(interaction.guild, q)
-        await interaction.followup.send("▶️ Starting playback…")
+    except Exception as e:
+        print(f"[cmd_play] Unhandled error: {e}")
+        try:
+            await interaction.followup.send("❌ Something went wrong. Please try again.", ephemeral=True)
+        except Exception:
+            pass
 
 
 @cmd_play.autocomplete("query")
