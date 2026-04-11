@@ -592,7 +592,7 @@ async def _update_presence(bot_ref: commands.Bot, track: Optional[Track]) -> Non
         pass
 
 
-async def _start_playing(guild: discord.Guild, q: GuildQueue, seek_secs: int = 0) -> None:
+async def _start_playing(guild: discord.Guild, q: GuildQueue, seek_secs: int = 0, send_np: bool = True) -> None:
     if not q.voice_client or q.current is None:
         return
     if not q.voice_client.is_connected():
@@ -636,7 +636,7 @@ async def _start_playing(guild: discord.Guild, q: GuildQueue, seek_secs: int = 0
         q.np_update_task = None
     q.np_message = None
 
-    if q.announce and q.text_channel and seek_secs == 0:
+    if send_np and q.announce and q.text_channel and seek_secs == 0:
         try:
             view = NowPlayingView(guild.id)
             msg  = await q.text_channel.send(
@@ -937,8 +937,17 @@ async def cmd_play(interaction: discord.Interaction, query: str):
             await interaction.followup.send(embed=embed)
         else:
             q.current = track
-            await _start_playing(interaction.guild, q)
-            await interaction.followup.send("▶️ Starting playback…")
+            await _start_playing(interaction.guild, q, send_np=False)
+            # Send Now Playing card as the guaranteed interaction response
+            view = NowPlayingView(interaction.guild_id)
+            msg = await interaction.followup.send(
+                embed=_now_playing_embed(q.current, q.loop_mode, q.play_start, q.bass_boost),
+                view=view,
+            )
+            # Register this message for live progress updates
+            q.np_message = msg
+            if not q.np_update_task or q.np_update_task.done():
+                q.np_update_task = asyncio.create_task(_np_updater(interaction.guild_id, q.current))
 
     except Exception as e:
         import traceback
