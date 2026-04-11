@@ -637,13 +637,16 @@ async def _start_playing(guild: discord.Guild, q: GuildQueue, seek_secs: int = 0
     q.np_message = None
 
     if q.announce and q.text_channel and seek_secs == 0:
-        view = NowPlayingView(guild.id)
-        msg  = await q.text_channel.send(
-            embed=_now_playing_embed(q.current, q.loop_mode, q.play_start, q.bass_boost),
-            view=view,
-        )
-        q.np_message = msg
-        q.np_update_task = asyncio.create_task(_np_updater(guild.id, q.current))
+        try:
+            view = NowPlayingView(guild.id)
+            msg  = await q.text_channel.send(
+                embed=_now_playing_embed(q.current, q.loop_mode, q.play_start, q.bass_boost),
+                view=view,
+            )
+            q.np_message = msg
+            q.np_update_task = asyncio.create_task(_np_updater(guild.id, q.current))
+        except Exception as e:
+            print(f"[Player] Could not send Now Playing card: {e}")
 
 
 async def _play_next(guild: discord.Guild) -> None:
@@ -938,9 +941,11 @@ async def cmd_play(interaction: discord.Interaction, query: str):
             await interaction.followup.send("▶️ Starting playback…")
 
     except Exception as e:
+        import traceback
         print(f"[cmd_play] Unhandled error: {e}")
+        traceback.print_exc()
         try:
-            await interaction.followup.send("❌ Something went wrong. Please try again.", ephemeral=True)
+            await interaction.followup.send(f"❌ Error: `{e}`", ephemeral=True)
         except Exception:
             pass
 
