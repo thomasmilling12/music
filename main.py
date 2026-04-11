@@ -4,6 +4,7 @@ import math
 import os
 import random
 import time
+import traceback
 import urllib.request
 from collections import deque
 from dataclasses import dataclass, field
@@ -72,6 +73,8 @@ class GuildQueue:
     # Seek/restart helpers
     restart_current:   bool = False
     seek_to:           int  = 0
+    # Pause tracking (to keep progress bar accurate)
+    paused_at:         Optional[float] = None
     # Vote-skip state
     vote_skip_users:   set  = field(default_factory=set)
     # Live now-playing update
@@ -405,10 +408,16 @@ class NowPlayingView(discord.ui.View):
         if not q or not q.voice_client:
             await interaction.response.send_message("❌ Not connected.", ephemeral=True); return
         if q.voice_client.is_playing():
-            q.voice_client.pause(); button.emoji = "▶️"
+            q.voice_client.pause()
+            q.paused_at = time.monotonic()
+            button.emoji = "▶️"
             await interaction.response.edit_message(view=self)
         elif q.voice_client.is_paused():
-            q.voice_client.resume(); button.emoji = "⏸️"
+            if q.paused_at and q.play_start:
+                q.play_start += time.monotonic() - q.paused_at
+            q.paused_at = None
+            q.voice_client.resume()
+            button.emoji = "⏸️"
             await interaction.response.edit_message(view=self)
         else:
             await interaction.response.send_message("❌ Nothing is playing.", ephemeral=True)
@@ -534,18 +543,31 @@ class SearchView(discord.ui.View):
 
         if self.q.voice_client and (self.q.voice_client.is_playing() or self.q.voice_client.is_paused() or self.q.current):
             self.q.tracks.append(track)
+            pos = len(self.q.tracks)
+            wait_secs = sum(t.duration_secs or 0 for t in list(self.q.tracks)[:-1])
+            if self.q.current and self.q.play_start and self.q.current.duration_secs:
+                elapsed = int(time.monotonic() - self.q.play_start)
+                wait_secs += max(0, self.q.current.duration_secs - elapsed)
             embed = discord.Embed(title="➕ Added to Queue",
                                   description=f"**[{track.title}]({track.webpage_url})**",
                                   color=0x5865F2)
-            embed.add_field(name="Duration", value=track.duration, inline=True)
-            embed.add_field(name="Position", value=str(len(self.q.tracks)), inline=True)
+            embed.add_field(name="Duration",   value=track.duration,              inline=True)
+            embed.add_field(name="Position",   value=f"#{pos}",                   inline=True)
+            embed.add_field(name="Est. wait",  value=format_duration(wait_secs),  inline=True)
             if track.thumbnail:
                 embed.set_thumbnail(url=track.thumbnail)
             await interaction.followup.send(embed=embed)
         else:
             self.q.current = track
-            await _start_playing(self.guild, self.q)
-            await interaction.followup.send("▶️ Starting playback…")
+            await _start_playing(self.guild, self.q, send_np=False)
+            view = NowPlayingView(self.guild.id)
+            msg = await interaction.followup.send(
+                embed=_now_playing_embed(self.q.current, self.q.loop_mode, self.q.play_start, self.q.bass_boost),
+                view=view,
+            )
+            self.q.np_message = msg
+            if not self.q.np_update_task or self.q.np_update_task.done():
+                self.q.np_update_task = asyncio.create_task(_np_updater(self.guild.id, self.q.current))
         self.stop()
 
 
@@ -607,6 +629,7 @@ async def _start_playing(guild: discord.Guild, q: GuildQueue, seek_secs: int = 0
 
     source       = _make_source(q.current, q.volume, seek_secs, q.bass_boost)
     q.play_start = time.monotonic() - seek_secs
+    q.paused_at  = None
     q.vote_skip_users.clear()
 
     if q.idle_task:
@@ -927,12 +950,18 @@ async def cmd_play(interaction: discord.Interaction, query: str):
 
         if q.voice_client.is_playing() or q.voice_client.is_paused() or q.current is not None:
             q.tracks.append(track)
+            pos = len(q.tracks)
+            wait_secs = sum(t.duration_secs or 0 for t in list(q.tracks)[:-1])
+            if q.current and q.play_start and q.current.duration_secs:
+                elapsed = int(time.monotonic() - q.play_start)
+                wait_secs += max(0, q.current.duration_secs - elapsed)
             embed = discord.Embed(title="➕ Added to Queue",
                                   description=f"**[{track.title}]({track.webpage_url})**",
                                   color=0x5865F2)
-            embed.add_field(name="Duration",     value=track.duration,         inline=True)
-            embed.add_field(name="Position",     value=str(len(q.tracks)),     inline=True)
-            embed.add_field(name="Requested by", value=track.requested_by,     inline=True)
+            embed.add_field(name="Duration",     value=track.duration,             inline=True)
+            embed.add_field(name="Position",     value=f"#{pos}",                  inline=True)
+            embed.add_field(name="Est. wait",    value=format_duration(wait_secs), inline=True)
+            embed.add_field(name="Requested by", value=track.requested_by,         inline=False)
             if track.thumbnail: embed.set_thumbnail(url=track.thumbnail)
             await interaction.followup.send(embed=embed)
         else:
@@ -950,11 +979,10 @@ async def cmd_play(interaction: discord.Interaction, query: str):
                 q.np_update_task = asyncio.create_task(_np_updater(interaction.guild_id, q.current))
 
     except Exception as e:
-        import traceback
         print(f"[cmd_play] Unhandled error: {e}")
         traceback.print_exc()
         try:
-            await interaction.followup.send(f"❌ Error: `{e}`", ephemeral=True)
+            await interaction.followup.send("❌ Something went wrong. Please try again.", ephemeral=True)
         except Exception:
             pass
 
@@ -1132,6 +1160,7 @@ async def cmd_pause(interaction: discord.Interaction):
     if not q or not q.voice_client or not q.voice_client.is_playing():
         await interaction.response.send_message("❌ Nothing is playing.", ephemeral=True); return
     q.voice_client.pause()
+    q.paused_at = time.monotonic()
     await interaction.response.send_message("⏸️ Paused.")
 
 
@@ -1142,6 +1171,9 @@ async def cmd_resume(interaction: discord.Interaction):
     q = queues.get(interaction.guild_id)
     if not q or not q.voice_client or not q.voice_client.is_paused():
         await interaction.response.send_message("❌ Nothing is paused.", ephemeral=True); return
+    if q.paused_at and q.play_start:
+        q.play_start += time.monotonic() - q.paused_at
+    q.paused_at = None
     q.voice_client.resume()
     await interaction.response.send_message("▶️ Resumed.")
 
