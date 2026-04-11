@@ -618,7 +618,10 @@ class MusicBot(commands.Bot):
         guild = discord.Object(id=GUILD_ID)
         self.tree.copy_global_to(guild=guild)
         await self.tree.sync(guild=guild)
-        print(f"📡 Slash commands synced to guild {GUILD_ID}")
+        # Remove all global commands so they don't show as duplicates
+        self.tree.clear_commands(guild=None)
+        await self.tree.sync()
+        print(f"📡 Slash commands synced to guild {GUILD_ID}, global commands cleared")
 
     async def on_ready(self):
         print(f"🤖 Logged in as {self.user}")
