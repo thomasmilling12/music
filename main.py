@@ -454,20 +454,11 @@ class MusicBot(commands.Bot):
         super().__init__(command_prefix="!", intents=intents)
 
     async def setup_hook(self):
-        # Clear any old global commands so they don't show up as duplicates
-        self.tree.clear_commands(guild=None)
         await self.tree.sync()
-        print("📡 Global commands cleared")
+        print("📡 Slash commands synced globally")
 
     async def on_ready(self):
         print(f"🤖 Logged in as {self.user}")
-        for guild in self.guilds:
-            try:
-                self.tree.copy_global_to(guild=guild)
-                await self.tree.sync(guild=guild)
-                print(f"📡 Commands synced to {guild.name}")
-            except Exception as e:
-                print(f"[Sync] Failed for {guild.name}: {e}")
 
     async def on_voice_state_update(
         self,
