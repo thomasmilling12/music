@@ -628,7 +628,7 @@ async def _start_playing(guild: discord.Guild, q: GuildQueue, seek_secs: int = 0
     q.voice_client.play(source, after=after_play)
     print(f"[Player] Now playing: {q.current.title}")
 
-    asyncio.create_task(_update_presence(guild._state.client, q.current))
+    asyncio.create_task(_update_presence(bot, q.current))
 
     # Cancel any previous live-update task
     if q.np_update_task:
@@ -675,7 +675,7 @@ async def _play_next(guild: discord.Guild) -> None:
 
     if not q.tracks:
         q.current = None
-        asyncio.create_task(_update_presence(guild._state.client, None))
+        asyncio.create_task(_update_presence(bot, None))
         if q.np_update_task:
             q.np_update_task.cancel()
             q.np_update_task = None
@@ -706,7 +706,7 @@ async def _handle_voice_drop(guild: discord.Guild) -> None:
     q.play_start = None
     q.np_message = None
     try:
-        await guild._state.client.change_presence(activity=None)
+        await bot.change_presence(activity=None)
     except Exception:
         pass
     if q.text_channel:
