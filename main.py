@@ -722,6 +722,16 @@ def _register_np(q: GuildQueue, msg: discord.Message, track: Track, guild_id: in
     q.np_update_task = asyncio.create_task(_np_updater(guild_id, track))
 
 
+async def _refresh_np_embed(q: GuildQueue) -> None:
+    """Immediately edit the live NP card to reflect a settings change (filter/eq/speed/etc)."""
+    if not q.np_message or not q.current:
+        return
+    try:
+        await q.np_message.edit(embed=_np_embed(q.current, q, q.play_start))
+    except Exception:
+        pass
+
+
 # ---------------------------------------------------------------------------
 # Interactive buttons — Now Playing card
 # ---------------------------------------------------------------------------
@@ -809,9 +819,15 @@ class QueueView(discord.ui.View):
         super().__init__(timeout=60)
         self.q    = q
         self.page = 0
+        self._update_buttons()
 
     def _total_pages(self) -> int:
         return max(1, math.ceil(len(self.q.tracks) / TRACKS_PER_PAGE))
+
+    def _update_buttons(self) -> None:
+        total = self._total_pages()
+        self.prev_page.disabled = self.page <= 0
+        self.next_page.disabled = self.page >= total - 1
 
     def _build_embed(self) -> discord.Embed:
         lines = []
@@ -849,12 +865,14 @@ class QueueView(discord.ui.View):
     async def prev_page(self, interaction: discord.Interaction, button: discord.ui.Button):
         if self.page > 0:
             self.page -= 1
+        self._update_buttons()
         await interaction.response.edit_message(embed=self._build_embed(), view=self)
 
     @discord.ui.button(label="Next ▶", style=discord.ButtonStyle.secondary)
     async def next_page(self, interaction: discord.Interaction, button: discord.ui.Button):
         if self.page < self._total_pages() - 1:
             self.page += 1
+        self._update_buttons()
         await interaction.response.edit_message(embed=self._build_embed(), view=self)
 
 
@@ -915,11 +933,17 @@ class SearchView(discord.ui.View):
 # ---------------------------------------------------------------------------
 
 class LyricsView(discord.ui.View):
-    def __init__(self, pages: list[str], title: str):
+    def __init__(self, pages: list[str], title: str, thumbnail: str = ""):
         super().__init__(timeout=120)
-        self.pages = pages
-        self.title = title
-        self.page  = 0
+        self.pages     = pages
+        self.title     = title
+        self.thumbnail = thumbnail
+        self.page      = 0
+        self._update_buttons()
+
+    def _update_buttons(self) -> None:
+        self.prev_page.disabled = self.page <= 0
+        self.next_page.disabled = self.page >= len(self.pages) - 1
 
     def _build_embed(self) -> discord.Embed:
         embed = discord.Embed(
@@ -928,18 +952,22 @@ class LyricsView(discord.ui.View):
             color       = 0x5865F2,
         )
         embed.set_footer(text=f"Page {self.page+1}/{len(self.pages)} • Powered by lyrics.ovh")
+        if self.thumbnail:
+            embed.set_thumbnail(url=self.thumbnail)
         return embed
 
     @discord.ui.button(label="◀ Prev", style=discord.ButtonStyle.secondary)
     async def prev_page(self, interaction: discord.Interaction, button: discord.ui.Button):
         if self.page > 0:
             self.page -= 1
+        self._update_buttons()
         await interaction.response.edit_message(embed=self._build_embed(), view=self)
 
     @discord.ui.button(label="Next ▶", style=discord.ButtonStyle.secondary)
     async def next_page(self, interaction: discord.Interaction, button: discord.ui.Button):
         if self.page < len(self.pages) - 1:
             self.page += 1
+        self._update_buttons()
         await interaction.response.edit_message(embed=self._build_embed(), view=self)
 
 
@@ -1739,14 +1767,25 @@ async def cmd_filter(interaction: discord.Interaction, preset: str):
     q = queues.get(interaction.guild_id)
     if not q:
         return await interaction.response.send_message("❌ Not connected.", ephemeral=True)
+    if not _same_vc(interaction, q):
+        return await interaction.response.send_message("❌ Join my voice channel first.", ephemeral=True)
+
+    speed_reset_note = ""
+    if preset != "off" and abs(q.speed - 1.0) > 0.01:
+        q.speed          = 1.0
+        speed_reset_note = "\n⚠️ Your speed setting was reset to 1.0× (filters handle tempo internally)."
+
     q.audio_filter = None if preset == "off" else preset
     if q.voice_client and q.current and (q.voice_client.is_playing() or q.voice_client.is_paused()):
         elapsed           = int(time.monotonic() - q.play_start) if q.play_start else 0
         q.restart_current = True
         q.seek_to         = elapsed
         q.voice_client.stop()
+    else:
+        asyncio.create_task(_refresh_np_embed(q))
+
     label = "❌ Filter removed." if preset == "off" else f"✅ Filter set to **{preset}**."
-    await interaction.response.send_message(label)
+    await interaction.response.send_message(label + speed_reset_note)
 
 
 @bot.tree.command(name="eq", description="Apply an equalizer preset (flat, bass, treble, pop, rock, jazz, classical)")
@@ -1766,39 +1805,43 @@ async def cmd_eq(interaction: discord.Interaction, preset: str):
     q = queues.get(interaction.guild_id)
     if not q:
         return await interaction.response.send_message("❌ Not connected.", ephemeral=True)
+    if not _same_vc(interaction, q):
+        return await interaction.response.send_message("❌ Join my voice channel first.", ephemeral=True)
     q.eq_preset = preset
     if q.voice_client and q.current and (q.voice_client.is_playing() or q.voice_client.is_paused()):
         elapsed           = int(time.monotonic() - q.play_start) if q.play_start else 0
         q.restart_current = True
         q.seek_to         = elapsed
         q.voice_client.stop()
+    else:
+        asyncio.create_task(_refresh_np_embed(q))
     await interaction.response.send_message(f"🎚 EQ set to **{preset}**.")
 
 
-@bot.tree.command(name="speed", description="Set playback speed (0.5–2.0) without changing pitch")
-@app_commands.describe(value="Speed multiplier, e.g. 1.5 for 1.5× or 0.75 for 75%")
+@bot.tree.command(name="speed", description="Set playback speed (0.25–3.0×) without pitch change")
+@app_commands.describe(value="Speed multiplier — e.g. 1.5 for faster, 0.75 for slower, 1.0 to reset")
 @music_channel_only()
 @dj_only()
-async def cmd_speed(interaction: discord.Interaction, value: str):
-    try:
-        speed = float(value)
-    except ValueError:
-        return await interaction.response.send_message("❌ Invalid speed. Use a number like `1.5` or `0.75`.", ephemeral=True)
-    if not 0.25 <= speed <= 3.0:
+async def cmd_speed(interaction: discord.Interaction, value: float):
+    if not 0.25 <= value <= 3.0:
         return await interaction.response.send_message("❌ Speed must be between **0.25** and **3.0**.", ephemeral=True)
     q = queues.get(interaction.guild_id)
     if not q:
         return await interaction.response.send_message("❌ Not connected.", ephemeral=True)
+    if not _same_vc(interaction, q):
+        return await interaction.response.send_message("❌ Join my voice channel first.", ephemeral=True)
     if q.audio_filter:
         return await interaction.response.send_message(
             "❌ Clear the current audio filter first (`/filter off`) before setting speed.", ephemeral=True)
-    q.speed = speed
+    q.speed = value
     if q.voice_client and q.current and (q.voice_client.is_playing() or q.voice_client.is_paused()):
         elapsed           = int(time.monotonic() - q.play_start) if q.play_start else 0
         q.restart_current = True
         q.seek_to         = elapsed
         q.voice_client.stop()
-    state = "✅ Speed reset to normal." if abs(speed - 1.0) < 0.01 else f"⏩ Speed set to **{speed:.2f}×**."
+    else:
+        asyncio.create_task(_refresh_np_embed(q))
+    state = "✅ Speed reset to normal." if abs(value - 1.0) < 0.01 else f"⏩ Speed set to **{value:.2f}×**."
     await interaction.response.send_message(state)
 
 
@@ -1835,12 +1878,16 @@ async def cmd_bass(interaction: discord.Interaction):
     q = queues.get(interaction.guild_id)
     if not q:
         return await interaction.response.send_message("❌ Not connected.", ephemeral=True)
+    if not _same_vc(interaction, q):
+        return await interaction.response.send_message("❌ Join my voice channel first.", ephemeral=True)
     q.bass_boost = not q.bass_boost
     if q.voice_client and q.current and (q.voice_client.is_playing() or q.voice_client.is_paused()):
         elapsed           = int(time.monotonic() - q.play_start) if q.play_start else 0
         q.restart_current = True
         q.seek_to         = elapsed
         q.voice_client.stop()
+    else:
+        asyncio.create_task(_refresh_np_embed(q))
     state = "🔊 **Bass boost ON**" if q.bass_boost else "🔈 **Bass boost OFF**"
     await interaction.response.send_message(state)
 
@@ -1916,8 +1963,9 @@ async def cmd_lyrics(interaction: discord.Interaction):
     if not q or not q.current:
         return await interaction.followup.send("❌ Nothing is playing.", ephemeral=True)
 
-    title  = q.current.title
-    lyrics = await fetch_lyrics(title)
+    title     = q.current.title
+    thumbnail = q.current.thumbnail
+    lyrics    = await fetch_lyrics(title)
     if not lyrics:
         return await interaction.followup.send(
             f"❌ Couldn't find lyrics for **{title}**. Try searching manually on Genius."
@@ -1938,9 +1986,11 @@ async def cmd_lyrics(interaction: discord.Interaction):
     if len(chunks) == 1:
         embed = discord.Embed(title=f"📜 {clean}", description=chunks[0], color=0x5865F2)
         embed.set_footer(text="Powered by lyrics.ovh")
+        if thumbnail:
+            embed.set_thumbnail(url=thumbnail)
         await interaction.followup.send(embed=embed)
     else:
-        view = LyricsView(chunks, clean)
+        view = LyricsView(chunks, clean, thumbnail=thumbnail)
         await interaction.followup.send(embed=view._build_embed(), view=view)
 
 
@@ -2073,6 +2123,74 @@ async def cmd_playlist(interaction: discord.Interaction,
 
 
 # ---------------------------------------------------------------------------
+# Slash commands — Extras (/back, /ping, /effects)
+# ---------------------------------------------------------------------------
+
+@bot.tree.command(name="back", description="Go back to the previous song")
+@music_channel_only()
+@dj_only()
+async def cmd_back(interaction: discord.Interaction):
+    q = queues.get(interaction.guild_id)
+    if not q or not q.history:
+        return await interaction.response.send_message("📭 No previous song in history.", ephemeral=True)
+    if not _same_vc(interaction, q):
+        return await interaction.response.send_message("❌ Join my voice channel first.", ephemeral=True)
+
+    prev = q.history.pop()
+    # Put current song back at the front of the queue so it plays after
+    if q.current:
+        q.tracks.appendleft(q.current)
+    q.current = prev
+
+    if q.voice_client and (q.voice_client.is_playing() or q.voice_client.is_paused()):
+        q.voice_client.stop()
+        await interaction.response.send_message(f"⏮️ Going back to **{prev.title}**.")
+    elif q.voice_client and q.voice_client.is_connected():
+        await _start_playing(interaction.guild, q)
+        await interaction.response.send_message(f"⏮️ Playing **{prev.title}**.")
+    else:
+        await interaction.response.send_message("❌ Not connected to a voice channel.", ephemeral=True)
+
+
+@bot.tree.command(name="ping", description="Check the bot's response latency")
+async def cmd_ping(interaction: discord.Interaction):
+    latency_ms = round(bot.latency * 1000)
+    if latency_ms < 100:
+        indicator = "🟢"
+    elif latency_ms < 250:
+        indicator = "🟡"
+    else:
+        indicator = "🔴"
+    await interaction.response.send_message(
+        f"{indicator} **Pong!** Latency: `{latency_ms} ms`", ephemeral=True
+    )
+
+
+@bot.tree.command(name="effects", description="Show all currently active audio effects at a glance")
+@music_channel_only()
+async def cmd_effects(interaction: discord.Interaction):
+    q = queues.get(interaction.guild_id)
+    if not q:
+        return await interaction.response.send_message("❌ Not connected.", ephemeral=True)
+
+    filt  = q.audio_filter.title() if q.audio_filter else "None"
+    eq    = q.eq_preset.title()
+    speed = f"{q.speed:.2f}×" if abs(q.speed - 1.0) > 0.01 else "Normal (1.00×)"
+    bass  = "On 🔊" if q.bass_boost else "Off"
+    vol   = f"{int(q.volume * 100)}%"
+
+    embed = discord.Embed(title="🎚 Active Audio Effects", color=0x5865F2)
+    embed.add_field(name="Filter",     value=filt,  inline=True)
+    embed.add_field(name="EQ Preset",  value=eq,    inline=True)
+    embed.add_field(name="Speed",      value=speed, inline=True)
+    embed.add_field(name="Bass Boost", value=bass,  inline=True)
+    embed.add_field(name="Volume",     value=vol,   inline=True)
+    if q.current:
+        embed.set_footer(text=f"Currently playing: {q.current.title}")
+    await interaction.response.send_message(embed=embed)
+
+
+# ---------------------------------------------------------------------------
 # Help
 # ---------------------------------------------------------------------------
 
@@ -2108,6 +2226,9 @@ async def cmd_help(interaction: discord.Interaction):
                "`/247` — stay connected forever\n"
                "`/announce` — toggle Now Playing cards\n"
                "`/lyrics` — show lyrics for the current song\n"
+               "`/back` — go back to the previous song\n"
+               "`/effects` — see all active audio effects at a glance\n"
+               "`/ping` — check bot latency\n"
                "`/stats` — uptime and current settings"), inline=False)
     embed.add_field(name="💡 Tips",
         value=(f"• DJ role: **{DJ_ROLE_NAME}** (server owner & admins always bypass)\n"
