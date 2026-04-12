@@ -9,9 +9,11 @@ import random
 import re
 import time
 import traceback
+import urllib.parse
 import urllib.request
 from collections import deque
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Optional, Union
 
 import discord
@@ -34,6 +36,10 @@ SONG_LIMIT       = int(os.getenv("SONG_LIMIT_PER_USER", "5"))  # 0 = unlimited
 IDLE_TIMEOUT     = 300    # seconds of silence before auto-leaving
 STREAM_TTL       = 18000  # re-fetch stream URL after 5 hours (YouTube URLs expire)
 BOT_START        = time.monotonic()
+# Any valid Twitch URL — only needed so Discord shows the purple streaming indicator
+TWITCH_URL       = os.getenv("TWITCH_URL", "https://twitch.tv/discord")
+# Where to store saved playlists on disk
+PLAYLIST_DIR     = Path(os.getenv("PLAYLIST_DIR", os.path.expanduser("~/discord-bot/playlists")))
 
 if not TOKEN:
     raise ValueError("DISCORD_TOKEN is not set in environment")
@@ -46,6 +52,45 @@ FFMPEG_BEFORE_OPTS = (
     "-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5 "
     "-thread_queue_size 512"
 )
+
+# ---------------------------------------------------------------------------
+# Audio filters & EQ presets
+# ---------------------------------------------------------------------------
+
+# Each value is a raw FFmpeg -af filter string
+AUDIO_FILTERS: dict[str, str] = {
+    "nightcore": "asetrate=44100*1.25,atempo=0.8",          # faster + higher pitch
+    "vaporwave": "asetrate=44100*0.75,atempo=1.333",         # slower + lower pitch
+    "slowed":    "asetrate=44100*0.9,atempo=1.111",          # slightly slower/lower
+    "8d":        "apulsator=hz=0.08",                        # panning 8D effect
+    "karaoke":   "pan=stereo|c0=c0-c1|c1=c1-c0",            # centre channel removal
+    "reverb":    "aecho=0.8:0.9:500|1000:0.5|0.3",          # echo/reverb
+}
+
+EQ_PRESETS: dict[str, Optional[str]] = {
+    "flat":      None,
+    "bass":      "bass=g=6",
+    "treble":    "treble=g=5",
+    "pop":       "equalizer=f=100:width_type=h:width=200:g=3,equalizer=f=4000:width_type=h:width=2000:g=4",
+    "rock":      "bass=g=4,equalizer=f=3000:width_type=h:width=1000:g=3",
+    "jazz":      "equalizer=f=300:width_type=h:width=300:g=2,equalizer=f=6000:width_type=h:width=3000:g=3",
+    "classical": "treble=g=4,equalizer=f=250:width_type=h:width=300:g=2",
+}
+
+
+def _atempo_chain(speed: float) -> str:
+    """Build a chain of atempo filters — handles values outside the 0.5–2.0 range."""
+    filters: list[str] = []
+    remaining = speed
+    while remaining > 2.0:
+        filters.append("atempo=2.0")
+        remaining /= 2.0
+    while remaining < 0.5:
+        filters.append("atempo=0.5")
+        remaining *= 2.0
+    filters.append(f"atempo={remaining:.4f}")
+    return ",".join(filters)
+
 
 # ---------------------------------------------------------------------------
 # Data structures
@@ -81,6 +126,11 @@ class GuildQueue:
     mode_247:        bool                          = False
     announce:        bool                          = True
     bass_boost:      bool                          = False
+    autoplay:        bool                          = False
+    # Audio effects (applied via FFmpeg filters)
+    audio_filter:    Optional[str]                 = None   # key in AUDIO_FILTERS, or None
+    eq_preset:       str                           = "flat" # key in EQ_PRESETS
+    speed:           float                         = 1.0    # playback speed multiplier
     # Seek/restart flags (set before stopping to restart at a given position)
     restart_current: bool                          = False
     seek_to:         int                           = 0
@@ -95,7 +145,6 @@ class GuildQueue:
 
 # Global state
 queues:      dict[int, GuildQueue]   = {}
-# Per-guild play lock — prevents _play_next() race conditions
 _play_locks: dict[int, asyncio.Lock] = {}
 
 
@@ -152,11 +201,12 @@ def parse_time(s: str) -> Optional[int]:
         return None
 
 
-def est_wait(q: GuildQueue) -> int:
-    """Estimate seconds until the last queued track will play."""
-    # Sum durations of all queued tracks except the last one (which is what we're computing wait for)
-    secs = sum(t.duration_secs or 0 for t in list(q.tracks)[:-1])
-    # Add remaining time on the current track
+def est_wait(q: GuildQueue, up_to_index: Optional[int] = None) -> int:
+    """Estimate seconds until a queued track plays.
+    If up_to_index is given, compute wait for that position (0-based); otherwise for the last."""
+    lst = list(q.tracks)
+    end = len(lst) if up_to_index is None else up_to_index
+    secs = sum(t.duration_secs or 0 for t in lst[:end])
     if q.current and q.play_start and q.current.duration_secs:
         elapsed = int(time.monotonic() - q.play_start)
         secs += max(0, q.current.duration_secs - elapsed)
@@ -341,21 +391,74 @@ async def search_youtube(query: str, count: int = 5) -> list[dict]:
         return []
 
 
+async def fetch_autoplay_track(current_title: str, history_urls: set[str]) -> Optional[Track]:
+    """Fetch a related YouTube track for autoplay, avoiding recently played songs."""
+    loop = asyncio.get_event_loop()
+
+    def _search():
+        opts = {**YDL_OPTS, "extract_flat": True, "noplaylist": True}
+        with yt_dlp.YoutubeDL(opts) as ydl:
+            info = ydl.extract_info(f"ytsearch8:{current_title}", download=False)
+            return info.get("entries", [])
+
+    try:
+        entries = await asyncio.wait_for(loop.run_in_executor(None, _search), timeout=10)
+    except Exception:
+        return None
+
+    # Pick the first result that wasn't recently played (skip index 0 = same song)
+    for entry in entries[1:]:
+        vid_id = entry.get("id", "")
+        if not vid_id:
+            continue
+        url = f"https://youtu.be/{vid_id}"
+        if url not in history_urls:
+            dur = entry.get("duration")
+            return Track(
+                title           = entry.get("title", "Unknown"),
+                webpage_url     = url,
+                stream_url      = "",
+                duration        = fmt_dur(dur),
+                duration_secs   = int(dur) if dur else None,
+                thumbnail       = entry.get("thumbnail", ""),
+                requested_by    = "Autoplay",
+                requested_by_id = 0,
+            )
+    return None
+
+
 # ---------------------------------------------------------------------------
 # Playback helpers
 # ---------------------------------------------------------------------------
 
-def _make_source(track: Track, volume: float,
-                 seek_secs: int = 0, bass: bool = False) -> discord.FFmpegOpusAudio:
+def _make_source(track: Track, volume: float, seek_secs: int = 0,
+                 bass: bool = False, audio_filter: Optional[str] = None,
+                 eq_preset: str = "flat", speed: float = 1.0) -> discord.FFmpegOpusAudio:
     before_opts = FFMPEG_BEFORE_OPTS
     if seek_secs > 0:
         before_opts = f"-ss {seek_secs} " + before_opts
 
-    filters = []
+    filters: list[str] = []
+
+    # 1. Audio filter (nightcore, vaporwave, etc.) — takes priority over bass_boost
+    if audio_filter and audio_filter in AUDIO_FILTERS:
+        filters.append(AUDIO_FILTERS[audio_filter])
+    else:
+        # 2. Speed control (only when no audio_filter, since those handle tempo internally)
+        if abs(speed - 1.0) > 0.01:
+            filters.append(_atempo_chain(speed))
+        # 3. Legacy bass boost toggle
+        if bass:
+            filters.append("bass=g=6")
+
+    # 4. EQ preset (stacked on top of everything)
+    eq = EQ_PRESETS.get(eq_preset)
+    if eq:
+        filters.append(eq)
+
+    # 5. Volume
     if abs(volume - 1.0) > 0.005:
         filters.append(f"volume={volume}")
-    if bass:
-        filters.append("bass=g=6")
 
     options = "-vn"
     if filters:
@@ -411,9 +514,27 @@ async def _resolve_stream(track: Track) -> bool:
 LOOP_LABELS = {"off": "Off", "song": "🔂 Song", "queue": "🔁 Queue"}
 
 
-def _np_embed(track: Track, loop_mode: str = "off",
-              play_start: Optional[float] = None,
-              bass: bool = False) -> discord.Embed:
+def _effect_summary(q: GuildQueue) -> str:
+    """One-line summary of active audio effects for the NP embed."""
+    parts = []
+    if q.audio_filter:
+        labels = {
+            "nightcore": "🌙 Nightcore", "vaporwave": "🌊 Vaporwave",
+            "slowed": "🐢 Slowed",       "8d": "🎧 8D",
+            "karaoke": "🎤 Karaoke",    "reverb": "🔊 Reverb",
+        }
+        parts.append(labels.get(q.audio_filter, q.audio_filter.title()))
+    if abs(q.speed - 1.0) > 0.01 and not q.audio_filter:
+        parts.append(f"⏩ {q.speed:.1f}x")
+    if q.eq_preset != "flat":
+        parts.append(f"🎚 {q.eq_preset.title()}")
+    if q.bass_boost and not q.audio_filter:
+        parts.append("🔊 Bass")
+    return "  ".join(parts) if parts else "None"
+
+
+def _np_embed(track: Track, q: GuildQueue,
+              play_start: Optional[float] = None) -> discord.Embed:
     embed = discord.Embed(
         title       = "🎵 Now Playing",
         description = f"**[{track.title}]({track.webpage_url})**",
@@ -428,10 +549,12 @@ def _np_embed(track: Track, loop_mode: str = "off",
         embed.add_field(name="Duration", value=track.duration, inline=True)
 
     embed.add_field(name="Requested by", value=track.requested_by, inline=True)
-    loop_val = LOOP_LABELS.get(loop_mode, "Off")
-    if bass:
-        loop_val += "  🔊 Bass"
+    loop_val = LOOP_LABELS.get(q.loop_mode, "Off")
     embed.add_field(name="Loop", value=loop_val, inline=True)
+
+    effects = _effect_summary(q)
+    embed.add_field(name="Effects", value=effects, inline=False)
+
     if track.thumbnail:
         embed.set_thumbnail(url=track.thumbnail)
     return embed
@@ -456,6 +579,112 @@ def _queued_embed(track: Track, q: GuildQueue) -> discord.Embed:
 
 
 # ---------------------------------------------------------------------------
+# Lyrics helper — uses lyrics.ovh (free, no API key)
+# ---------------------------------------------------------------------------
+
+async def fetch_lyrics(title: str) -> Optional[str]:
+    """Fetch lyrics for a song title. Tries to parse 'Artist - Song' format first."""
+    loop = asyncio.get_event_loop()
+
+    # Try to split "Artist - Song" or "Song - Artist" patterns
+    if " - " in title:
+        parts = title.split(" - ", 1)
+        candidates = [
+            (parts[0].strip(), parts[1].strip()),  # Artist - Song
+            (parts[1].strip(), parts[0].strip()),  # Song - Artist (reversed)
+        ]
+    else:
+        # No separator — use the title as song, leave artist blank (lyrics.ovh handles it)
+        candidates = [("", title)]
+
+    def _fetch(artist: str, song: str) -> Optional[str]:
+        # Clean up common YouTube title noise before querying
+        song   = re.sub(r"\s*[\(\[][^\)\]]*[\)\]]", "", song).strip()
+        artist = re.sub(r"\s*[\(\[][^\)\]]*[\)\]]", "", artist).strip()
+        if artist:
+            url = (f"https://api.lyrics.ovh/v1/"
+                   f"{urllib.parse.quote(artist)}/{urllib.parse.quote(song)}")
+        else:
+            url = f"https://api.lyrics.ovh/v1/Unknown/{urllib.parse.quote(song)}"
+        req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+        try:
+            with urllib.request.urlopen(req, timeout=6) as r:
+                data = json.loads(r.read())
+                return data.get("lyrics")
+        except Exception:
+            return None
+
+    for artist, song in candidates:
+        try:
+            lyrics = await asyncio.wait_for(
+                loop.run_in_executor(None, _fetch, artist, song), timeout=8
+            )
+            if lyrics and len(lyrics) > 20:
+                return lyrics.strip()
+        except Exception:
+            continue
+    return None
+
+
+# ---------------------------------------------------------------------------
+# Saved playlists — stored as JSON files per guild
+# ---------------------------------------------------------------------------
+
+def _playlist_path(guild_id: int, name: str) -> Path:
+    return PLAYLIST_DIR / str(guild_id) / f"{name}.json"
+
+
+def _save_playlist(guild_id: int, name: str, tracks: list[Track]) -> None:
+    path = _playlist_path(guild_id, name)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    data = [
+        {"title": t.title, "webpage_url": t.webpage_url,
+         "duration": t.duration, "duration_secs": t.duration_secs,
+         "thumbnail": t.thumbnail, "requested_by": t.requested_by}
+        for t in tracks
+    ]
+    path.write_text(json.dumps(data, indent=2))
+
+
+def _load_playlist(guild_id: int, name: str) -> Optional[list[Track]]:
+    path = _playlist_path(guild_id, name)
+    if not path.exists():
+        return None
+    try:
+        data = json.loads(path.read_text())
+        return [
+            Track(
+                title           = e["title"],
+                webpage_url     = e["webpage_url"],
+                stream_url      = "",   # resolved lazily at play time
+                duration        = e.get("duration", "?:??"),
+                duration_secs   = e.get("duration_secs"),
+                thumbnail       = e.get("thumbnail", ""),
+                requested_by    = e.get("requested_by", "Playlist"),
+                requested_by_id = 0,
+            )
+            for e in data
+        ]
+    except Exception:
+        return None
+
+
+def _list_playlists(guild_id: int) -> list[str]:
+    folder = PLAYLIST_DIR / str(guild_id)
+    if not folder.exists():
+        return []
+    return [p.stem for p in sorted(folder.glob("*.json"))]
+
+
+def _delete_playlist(guild_id: int, name: str) -> bool:
+    path = _playlist_path(guild_id, name)
+    if path.exists():
+        path.unlink()
+        return True
+    return False
+
+
+# ---------------------------------------------------------------------------
 # Live Now Playing updater
 # ---------------------------------------------------------------------------
 
@@ -468,15 +697,12 @@ async def _np_updater(guild_id: int, track: Track) -> None:
             return
         try:
             await q.np_message.edit(
-                embed=_np_embed(track, q.loop_mode, q.play_start, q.bass_boost)
+                embed=_np_embed(track, q, q.play_start)
             )
         except discord.NotFound:
-            # Message was deleted — stop updating silently
             q.np_message = None
             return
-        except discord.Forbidden:
-            return
-        except Exception:
+        except (discord.Forbidden, Exception):
             return
         await asyncio.sleep(20)
 
@@ -572,7 +798,7 @@ class NowPlayingView(discord.ui.View):
 
 
 # ---------------------------------------------------------------------------
-# Paginated queue view
+# Paginated queue view — shows per-song estimated wait time
 # ---------------------------------------------------------------------------
 
 TRACKS_PER_PAGE = 10
@@ -594,12 +820,19 @@ class QueueView(discord.ui.View):
                 f"**▶️ Now Playing:** [{self.q.current.title}]({self.q.current.webpage_url}) "
                 f"`{self.q.current.duration}` — {self.q.current.requested_by}"
             )
+
         lst   = list(self.q.tracks)
         start = self.page * TRACKS_PER_PAGE
-        for i, t in enumerate(lst[start:start + TRACKS_PER_PAGE], start + 1):
-            lines.append(f"`{i}.` [{t.title}]({t.webpage_url}) `{t.duration}` — {t.requested_by}")
+        # Pre-compute cumulative wait times for the visible slice
+        for i, t in enumerate(lst[start:start + TRACKS_PER_PAGE], start):
+            wait = est_wait(self.q, up_to_index=i)
+            lines.append(
+                f"`{i+1}.` [{t.title}]({t.webpage_url}) `{t.duration}` "
+                f"— {t.requested_by} *(in {fmt_dur(wait)})*"
+            )
 
         total_secs = sum(t.duration_secs or 0 for t in self.q.tracks)
+        autoplay_str = "  •  🔄 Autoplay ON" if self.q.autoplay else ""
         embed = discord.Embed(
             title       = "🎵 Queue",
             description = "\n".join(lines) if lines else "The queue is empty.",
@@ -608,6 +841,7 @@ class QueueView(discord.ui.View):
         embed.set_footer(
             text=f"Page {self.page+1}/{self._total_pages()} • "
                  f"{len(self.q.tracks)} song(s) • Total: {fmt_dur(total_secs) if total_secs else '?'}"
+                 f"{autoplay_str}"
         )
         return embed
 
@@ -669,7 +903,7 @@ class SearchView(discord.ui.View):
             await _start_playing(self.guild, self.q, send_np=False)
             view = NowPlayingView(self.guild.id)
             msg  = await interaction.followup.send(
-                embed=_np_embed(self.q.current, self.q.loop_mode, self.q.play_start, self.q.bass_boost),
+                embed=_np_embed(self.q.current, self.q, self.q.play_start),
                 view=view,
             )
             _register_np(self.q, msg, track, self.guild.id)
@@ -677,49 +911,79 @@ class SearchView(discord.ui.View):
 
 
 # ---------------------------------------------------------------------------
+# Lyrics paginator
+# ---------------------------------------------------------------------------
+
+class LyricsView(discord.ui.View):
+    def __init__(self, pages: list[str], title: str):
+        super().__init__(timeout=120)
+        self.pages = pages
+        self.title = title
+        self.page  = 0
+
+    def _build_embed(self) -> discord.Embed:
+        embed = discord.Embed(
+            title       = f"📜 {self.title}",
+            description = self.pages[self.page],
+            color       = 0x5865F2,
+        )
+        embed.set_footer(text=f"Page {self.page+1}/{len(self.pages)} • Powered by lyrics.ovh")
+        return embed
+
+    @discord.ui.button(label="◀ Prev", style=discord.ButtonStyle.secondary)
+    async def prev_page(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if self.page > 0:
+            self.page -= 1
+        await interaction.response.edit_message(embed=self._build_embed(), view=self)
+
+    @discord.ui.button(label="Next ▶", style=discord.ButtonStyle.secondary)
+    async def next_page(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if self.page < len(self.pages) - 1:
+            self.page += 1
+        await interaction.response.edit_message(embed=self._build_embed(), view=self)
+
+
+# ---------------------------------------------------------------------------
 # Core playback engine
 # ---------------------------------------------------------------------------
 
-# Regex to strip common YouTube title noise before showing as activity
+# Regex to strip common YouTube title noise for the activity status
 _TITLE_NOISE = re.compile(
     r"\s*[\(\[]\s*(?:"
     r"official\s*(?:music\s*)?(?:video|audio|lyric\s*video|visualizer)?|"
     r"lyrics?|audio|hd|hq|4k|visualizer|live\s*(?:version|performance)?|"
     r"explicit|clean\s*version?|extended\s*(?:version|mix)?|"
-    r"radio\s*edit|full\s*version?|remastered|mv|"
-    r"\d{4}"  # year in brackets e.g. [2024]
+    r"radio\s*edit|full\s*version?|remastered|mv|\d{4}"
     r")\s*[\)\]]",
     re.IGNORECASE,
 )
 
 
 def _clean_title(title: str) -> str:
-    """Remove common YouTube suffixes to get a cleaner song name."""
     cleaned = _TITLE_NOISE.sub("", title).strip(" -–—|")
     return cleaned if cleaned else title
 
 
-async def _update_presence(track: Optional[Track]) -> None:
-    """Update the bot's Discord status to reflect what's playing."""
+async def _update_presence(track: Optional[Track], is_playing: bool = False) -> None:
+    """Update the bot's Discord status.
+    While playing: purple streaming dot + song title [duration].
+    When idle: yellow idle dot with a prompt."""
     try:
-        if track:
-            # Clean title and append duration so it reads e.g. "E85 [3:42]"
+        if track and is_playing:
             name = _clean_title(track.title)
             if track.duration and track.duration not in ("?:??", "Unknown"):
                 name = f"{name} [{track.duration}]"
             await bot.change_presence(
-                activity=discord.Activity(
-                    type=discord.ActivityType.listening,
-                    name=name[:128],
-                )
+                status   = discord.Status.do_not_disturb,
+                activity = discord.Streaming(name=name[:128], url=TWITCH_URL),
             )
         else:
-            # Show a subtle idle status instead of going blank
             await bot.change_presence(
-                activity=discord.Activity(
-                    type=discord.ActivityType.listening,
-                    name="nothing — use /play",
-                )
+                status   = discord.Status.idle,
+                activity = discord.Activity(
+                    type = discord.ActivityType.listening,
+                    name = "nothing — use /play",
+                ),
             )
     except Exception:
         pass
@@ -735,13 +999,18 @@ async def _start_playing(guild: discord.Guild, q: GuildQueue,
         q.current = None
         return
 
-    # Resolve or refresh the stream URL (handles playlist lazy-load and TTL expiry)
     if not await _resolve_stream(q.current):
         print(f"[Player] Could not resolve stream for '{q.current.title}' — skipping")
         await _play_next(guild)
         return
 
-    source       = _make_source(q.current, q.volume, seek_secs, q.bass_boost)
+    source = _make_source(
+        q.current, q.volume, seek_secs,
+        bass         = q.bass_boost,
+        audio_filter = q.audio_filter,
+        eq_preset    = q.eq_preset,
+        speed        = q.speed,
+    )
     q.play_start = time.monotonic() - seek_secs
     q.paused_at  = None
     q.vote_skip_users.clear()
@@ -755,7 +1024,6 @@ async def _start_playing(guild: discord.Guild, q: GuildQueue,
             print(f"[Player] Playback error: {error!r}")
             err_str = str(error)
             if "4006" in err_str or "ConnectionClosed" in type(error).__name__:
-                # Voice session invalidated — attempt recovery
                 asyncio.run_coroutine_threadsafe(
                     _handle_voice_drop(guild), guild._state.loop
                 )
@@ -764,16 +1032,15 @@ async def _start_playing(guild: discord.Guild, q: GuildQueue,
 
     q.voice_client.play(source, after=after_play)
     print(f"[Player] ▶ {q.current.title}")
-    asyncio.create_task(_update_presence(q.current))
+    asyncio.create_task(_update_presence(q.current, is_playing=True))
 
-    # Reset NP tracking before potentially setting a new message
     _cancel_np_tasks(q)
 
     if send_np and q.announce and q.text_channel and seek_secs == 0:
         try:
             view = NowPlayingView(guild.id)
             msg  = await q.text_channel.send(
-                embed=_np_embed(q.current, q.loop_mode, q.play_start, q.bass_boost),
+                embed=_np_embed(q.current, q, q.play_start),
                 view=view,
             )
             _register_np(q, msg, q.current, guild.id)
@@ -783,17 +1050,16 @@ async def _start_playing(guild: discord.Guild, q: GuildQueue,
 
 async def _play_next(guild: discord.Guild) -> None:
     """Advance the queue to the next track.
-    Protected by a per-guild lock to prevent race conditions on skip/stop/auto-advance."""
+    Protected by a per-guild lock to prevent race conditions."""
     lock = get_play_lock(guild.id)
     if lock.locked():
-        # Another coroutine is already advancing the queue — bail out
         return
     async with lock:
         q = queues.get(guild.id)
         if q is None:
             return
 
-        # Honour seek/restart requests (from /seek, /volume, /bass, /replay)
+        # Honour seek/restart requests
         if q.restart_current:
             q.restart_current = False
             seek   = q.seek_to
@@ -806,16 +1072,31 @@ async def _play_next(guild: discord.Guild) -> None:
             await _start_playing(guild, q)
             return
 
-        # Archive finished track in history
+        # Archive finished track
         if q.current:
             q.history.append(q.current)
             q.songs_played += 1
 
-        # Loop queue — re-add finished track to back
+        # Loop queue
         if q.loop_mode == "queue" and q.current:
             q.tracks.append(q.current)
 
-        # Queue exhausted
+        # Queue exhausted — try autoplay before giving up
+        if not q.tracks:
+            if q.autoplay and q.current:
+                print(f"[Autoplay] Finding related song for '{q.current.title}'…")
+                history_urls = {t.webpage_url for t in q.history}
+                autoplay_track = await fetch_autoplay_track(q.current.title, history_urls)
+                if autoplay_track:
+                    q.tracks.append(autoplay_track)
+                    if q.text_channel:
+                        try:
+                            await q.text_channel.send(
+                                f"🔄 **Autoplay:** Adding *{autoplay_track.title}*"
+                            )
+                        except Exception:
+                            pass
+
         if not q.tracks:
             q.current = None
             asyncio.create_task(_update_presence(None))
@@ -831,8 +1112,7 @@ async def _play_next(guild: discord.Guild) -> None:
 
 
 async def _handle_voice_drop(guild: discord.Guild) -> None:
-    """Handle voice WebSocket disconnects (error 4006).
-    Attempts to reconnect up to 3 times, then resumes from where it left off."""
+    """Handle voice WebSocket disconnects. Attempts reconnect up to 3 times."""
     q = queues.get(guild.id)
     if not q:
         return
@@ -850,10 +1130,7 @@ async def _handle_voice_drop(guild: discord.Guild) -> None:
 
     reconnected = False
     for attempt in range(1, 4):
-        delay = 5 * attempt  # 5 s, 10 s, 15 s
-        await asyncio.sleep(delay)
-
-        # Don't reconnect to an empty channel
+        await asyncio.sleep(5 * attempt)
         if not channel or not any(not m.bot for m in channel.members):
             print("[Voice] Channel empty — stopping reconnect")
             break
@@ -873,7 +1150,6 @@ async def _handle_voice_drop(guild: discord.Guild) -> None:
             print(f"[Voice] Reconnect attempt {attempt} failed: {e}")
 
     if reconnected and q.current:
-        # Resume from where it was before the drop
         q.restart_current = True
         q.seek_to         = elapsed
         asyncio.create_task(_play_next(guild))
@@ -883,7 +1159,6 @@ async def _handle_voice_drop(guild: discord.Guild) -> None:
             except Exception:
                 pass
     else:
-        # Give up — clear playback state, let user resume manually
         q.current    = None
         q.play_start = None
         asyncio.create_task(_update_presence(None))
@@ -933,13 +1208,13 @@ class MusicBot(commands.Bot):
 
     async def on_ready(self):
         print(f"🤖 Logged in as {self.user} (ID: {self.user.id})")
-        # Set the initial idle status so the bot always shows something
         try:
             await self.change_presence(
-                activity=discord.Activity(
-                    type=discord.ActivityType.listening,
-                    name="nothing — use /play",
-                )
+                status   = discord.Status.idle,
+                activity = discord.Activity(
+                    type = discord.ActivityType.listening,
+                    name = "nothing — use /play",
+                ),
             )
         except Exception:
             pass
@@ -949,7 +1224,6 @@ class MusicBot(commands.Bot):
                                      after: discord.VoiceState):
         guild = member.guild
 
-        # Detect when the bot itself is forcefully disconnected by Discord/admin
         if member.bot and member.id == self.user.id:
             if before.channel and not after.channel:
                 q = queues.get(guild.id)
@@ -958,7 +1232,6 @@ class MusicBot(commands.Bot):
                     asyncio.create_task(_handle_voice_drop(guild))
             return
 
-        # Only act on human members leaving the bot's channel
         vc = guild.voice_client
         if not vc or not vc.channel:
             return
@@ -972,13 +1245,12 @@ class MusicBot(commands.Bot):
 
         humans = [m for m in vc.channel.members if not m.bot]
         if humans:
-            return  # Still people in the channel — stay put
+            return
 
         q = queues.get(guild.id)
         if q and q.mode_247:
-            return  # 24/7 mode — never auto-leave
+            return
 
-        # Channel is now empty — stop and disconnect cleanly
         if vc.is_playing() or vc.is_paused():
             vc.stop()
         await vc.disconnect()
@@ -1028,8 +1300,7 @@ def dj_only():
 
 
 async def ensure_voice(interaction: discord.Interaction) -> Optional[GuildQueue]:
-    """Connect the bot to the user's voice channel (or validate the current one).
-    All callers must call defer() first. Returns None on failure."""
+    """Connect the bot to the user's voice channel. All callers must defer() first."""
     if not interaction.user.voice or not interaction.user.voice.channel:
         await interaction.followup.send("❌ Join a voice channel first.", ephemeral=True)
         return None
@@ -1038,7 +1309,6 @@ async def ensure_voice(interaction: discord.Interaction) -> Optional[GuildQueue]
     channel = interaction.user.voice.channel
     existing_vc = interaction.guild.voice_client
 
-    # Refuse if bot is actively playing in a different channel
     if (existing_vc and existing_vc.is_connected()
             and existing_vc.channel and existing_vc.channel != channel
             and (existing_vc.is_playing() or existing_vc.is_paused())):
@@ -1066,7 +1336,6 @@ async def ensure_voice(interaction: discord.Interaction) -> Optional[GuildQueue]
             vc = await asyncio.wait_for(channel.connect(reconnect=True), timeout=20)
             q.voice_client = vc
         except asyncio.TimeoutError:
-            print("[Voice] connect() timed out")
             await interaction.followup.send("❌ Timed out joining your voice channel. Try again.", ephemeral=True)
             return None
         except Exception as e:
@@ -1105,11 +1374,7 @@ async def _search_suggestions(current: str) -> list[app_commands.Choice[str]]:
         if not vid_id:
             continue
         dur = e.get("duration")
-        if dur:
-            m, s = divmod(int(dur), 60)
-            label = f"{title} ({m}:{s:02d})"
-        else:
-            label = title
+        label = f"{title} ({fmt_dur(dur)})" if dur else title
         choices.append(
             app_commands.Choice(name=label[:100], value=f"https://youtu.be/{vid_id}"[:100])
         )
@@ -1137,7 +1402,6 @@ async def cmd_play(interaction: discord.Interaction, query: str):
                 ephemeral=True,
             )
 
-        # --- Playlist ---
         is_playlist = ("list=" in query) and query.startswith(("http://", "https://"))
         if is_playlist:
             tracks = await fetch_playlist(query, str(interaction.user), uid)
@@ -1153,7 +1417,6 @@ async def cmd_play(interaction: discord.Interaction, query: str):
                 f"{'▶️ Starting' if start_now else '➕ Added'} **{len(tracks)} songs** from the playlist."
             )
 
-        # --- Single track ---
         track = await fetch_track(query, str(interaction.user), uid)
         if track is None:
             return await interaction.followup.send("❌ Couldn't find that song. Try a different search.")
@@ -1168,7 +1431,7 @@ async def cmd_play(interaction: discord.Interaction, query: str):
             await _start_playing(interaction.guild, q, send_np=False)
             view = NowPlayingView(interaction.guild_id)
             msg  = await interaction.followup.send(
-                embed=_np_embed(q.current, q.loop_mode, q.play_start, q.bass_boost),
+                embed=_np_embed(q.current, q, q.play_start),
                 view=view,
             )
             _register_np(q, msg, track, interaction.guild_id)
@@ -1198,19 +1461,15 @@ async def cmd_playnext(interaction: discord.Interaction, query: str):
     q = await ensure_voice(interaction)
     if q is None:
         return
-
     track = await fetch_track(query, str(interaction.user), interaction.user.id)
     if track is None:
         return await interaction.followup.send("❌ Couldn't find that song.")
     if isinstance(track, str):
         return await interaction.followup.send(track)
-
     q.tracks.appendleft(track)
-    embed = discord.Embed(
-        title       = "⏫ Playing Next",
-        description = f"**[{track.title}]({track.webpage_url})**",
-        color       = 0x5865F2,
-    )
+    embed = discord.Embed(title="⏫ Playing Next",
+                          description=f"**[{track.title}]({track.webpage_url})**",
+                          color=0x5865F2)
     embed.add_field(name="Duration", value=track.duration, inline=True)
     if track.thumbnail:
         embed.set_thumbnail(url=track.thumbnail)
@@ -1232,11 +1491,9 @@ async def cmd_search(interaction: discord.Interaction, query: str):
     q = await ensure_voice(interaction)
     if q is None:
         return
-
     entries = await search_youtube(query, count=5)
     if not entries:
         return await interaction.followup.send("❌ No results found. Try a different search.")
-
     lines = []
     for i, e in enumerate(entries[:5], 1):
         title  = e.get("title", "Unknown")
@@ -1244,12 +1501,8 @@ async def cmd_search(interaction: discord.Interaction, query: str):
         vid_id = e.get("id", "")
         url    = f"https://youtu.be/{vid_id}" if vid_id else ""
         lines.append(f"`{i}.` [{title}]({url}) `{fmt_dur(dur) if dur else '?'}`")
-
-    embed = discord.Embed(
-        title       = f"🔍 Results for: {query}",
-        description = "\n".join(lines),
-        color       = 0x5865F2,
-    )
+    embed = discord.Embed(title=f"🔍 Results for: {query}",
+                          description="\n".join(lines), color=0x5865F2)
     embed.set_footer(text="Pick a song from the dropdown below")
     view = SearchView(entries[:5], interaction.guild, q, str(interaction.user), interaction.user.id)
     await interaction.followup.send(embed=embed, view=view)
@@ -1267,30 +1520,23 @@ async def cmd_skip(interaction: discord.Interaction):
         return await interaction.response.send_message("❌ Nothing is playing.", ephemeral=True)
     if not _same_vc(interaction, q):
         return await interaction.response.send_message("❌ Join my voice channel first.", ephemeral=True)
-
     if has_dj_role(interaction.user):
         q.vote_skip_users.clear()
         q.voice_client.stop()
         return await interaction.response.send_message("⏭️ Skipped.")
-
-    # Vote skip for non-DJs
     listeners = [m for m in q.voice_client.channel.members if not m.bot]
     needed    = max(1, math.ceil(len(listeners) / 2))
-
     if interaction.user.id in q.vote_skip_users:
         return await interaction.response.send_message("🗳️ You already voted to skip.", ephemeral=True)
-
     q.vote_skip_users.add(interaction.user.id)
     valid_votes = sum(1 for uid in q.vote_skip_users if any(m.id == uid for m in listeners))
-
     if valid_votes >= needed:
         q.vote_skip_users.clear()
         q.voice_client.stop()
         await interaction.response.send_message(f"⏭️ Vote skip passed! ({valid_votes}/{needed})")
     else:
         await interaction.response.send_message(
-            f"🗳️ Skip vote: **{valid_votes}/{needed}** — need {needed - valid_votes} more."
-        )
+            f"🗳️ Skip vote: **{valid_votes}/{needed}** — need {needed - valid_votes} more.")
 
 
 @bot.tree.command(name="skipto", description="Skip to a specific position in the queue")
@@ -1303,12 +1549,10 @@ async def cmd_skipto(interaction: discord.Interaction, position: int):
         return await interaction.response.send_message("❌ The queue is empty.", ephemeral=True)
     if position < 1 or position > len(q.tracks):
         return await interaction.response.send_message(f"❌ Position must be 1–{len(q.tracks)}.", ephemeral=True)
-
     lst = list(q.tracks)
     for t in lst[:position - 1]:
         q.history.append(t)
     q.tracks = deque(lst[position - 1:])
-
     if q.voice_client and (q.voice_client.is_playing() or q.voice_client.is_paused()):
         q.voice_client.stop()
         await interaction.response.send_message(f"⏭️ Jumped to position **{position}**.")
@@ -1326,17 +1570,12 @@ async def cmd_seek(interaction: discord.Interaction, timestamp: str):
     q = queues.get(interaction.guild_id)
     if not q or not q.current:
         return await interaction.response.send_message("❌ Nothing is playing.", ephemeral=True)
-
     secs = parse_time(timestamp)
     if secs is None:
-        return await interaction.response.send_message(
-            "❌ Invalid time. Use format `1:30` or `90` (seconds).", ephemeral=True)
-
+        return await interaction.response.send_message("❌ Invalid time. Use `1:30` or `90`.", ephemeral=True)
     dur = q.current.duration_secs or 0
     if dur and secs >= dur:
-        return await interaction.response.send_message(
-            f"❌ Song is only {q.current.duration} long.", ephemeral=True)
-
+        return await interaction.response.send_message(f"❌ Song is only {q.current.duration} long.", ephemeral=True)
     q.restart_current = True
     q.seek_to         = secs
     if q.voice_client and (q.voice_client.is_playing() or q.voice_client.is_paused()):
@@ -1351,7 +1590,6 @@ async def cmd_stop(interaction: discord.Interaction):
     q = queues.get(interaction.guild_id)
     if not q or not q.voice_client:
         return await interaction.response.send_message("❌ Not connected.", ephemeral=True)
-
     _cancel_np_tasks(q)
     if q.idle_task:
         q.idle_task.cancel()
@@ -1359,7 +1597,6 @@ async def cmd_stop(interaction: discord.Interaction):
     q.tracks.clear()
     q.current         = None
     q.restart_current = False
-
     if q.voice_client.is_playing() or q.voice_client.is_paused():
         q.voice_client.stop()
     await q.voice_client.disconnect()
@@ -1417,11 +1654,8 @@ async def cmd_loop(interaction: discord.Interaction):
         return await interaction.response.send_message("❌ Nothing is playing.", ephemeral=True)
     modes   = ["off", "song", "queue"]
     q.loop_mode = modes[(modes.index(q.loop_mode) + 1) % len(modes)]
-    labels  = {
-        "off":   "🔁 Loop is now **Off**",
-        "song":  "🔂 Looping the **current song**",
-        "queue": "🔁 Looping the **entire queue**",
-    }
+    labels  = {"off": "🔁 Loop is now **Off**", "song": "🔂 Looping the **current song**",
+               "queue": "🔁 Looping the **entire queue**"}
     await interaction.response.send_message(labels[q.loop_mode])
 
 
@@ -1485,6 +1719,90 @@ async def cmd_move(interaction: discord.Interaction, from_pos: int, to_pos: int)
 
 
 # ---------------------------------------------------------------------------
+# Slash commands — Audio effects
+# ---------------------------------------------------------------------------
+
+@bot.tree.command(name="filter", description="Apply an audio filter (nightcore, vaporwave, 8d, slowed, karaoke, reverb, off)")
+@app_commands.describe(preset="Filter to apply — use 'off' to remove")
+@app_commands.choices(preset=[
+    app_commands.Choice(name="🌙 Nightcore (faster + higher pitch)", value="nightcore"),
+    app_commands.Choice(name="🌊 Vaporwave (slower + lower pitch)",  value="vaporwave"),
+    app_commands.Choice(name="🐢 Slowed (slightly slower/lower)",    value="slowed"),
+    app_commands.Choice(name="🎧 8D Audio (panning effect)",         value="8d"),
+    app_commands.Choice(name="🎤 Karaoke (remove vocals)",           value="karaoke"),
+    app_commands.Choice(name="🔊 Reverb (echo effect)",              value="reverb"),
+    app_commands.Choice(name="❌ Off (remove all filters)",           value="off"),
+])
+@music_channel_only()
+@dj_only()
+async def cmd_filter(interaction: discord.Interaction, preset: str):
+    q = queues.get(interaction.guild_id)
+    if not q:
+        return await interaction.response.send_message("❌ Not connected.", ephemeral=True)
+    q.audio_filter = None if preset == "off" else preset
+    if q.voice_client and q.current and (q.voice_client.is_playing() or q.voice_client.is_paused()):
+        elapsed           = int(time.monotonic() - q.play_start) if q.play_start else 0
+        q.restart_current = True
+        q.seek_to         = elapsed
+        q.voice_client.stop()
+    label = "❌ Filter removed." if preset == "off" else f"✅ Filter set to **{preset}**."
+    await interaction.response.send_message(label)
+
+
+@bot.tree.command(name="eq", description="Apply an equalizer preset (flat, bass, treble, pop, rock, jazz, classical)")
+@app_commands.describe(preset="EQ preset to apply")
+@app_commands.choices(preset=[
+    app_commands.Choice(name="Flat (no EQ)",          value="flat"),
+    app_commands.Choice(name="🔊 Bass Boost",         value="bass"),
+    app_commands.Choice(name="✨ Treble Boost",       value="treble"),
+    app_commands.Choice(name="🎵 Pop",                value="pop"),
+    app_commands.Choice(name="🎸 Rock",               value="rock"),
+    app_commands.Choice(name="🎷 Jazz",               value="jazz"),
+    app_commands.Choice(name="🎻 Classical",          value="classical"),
+])
+@music_channel_only()
+@dj_only()
+async def cmd_eq(interaction: discord.Interaction, preset: str):
+    q = queues.get(interaction.guild_id)
+    if not q:
+        return await interaction.response.send_message("❌ Not connected.", ephemeral=True)
+    q.eq_preset = preset
+    if q.voice_client and q.current and (q.voice_client.is_playing() or q.voice_client.is_paused()):
+        elapsed           = int(time.monotonic() - q.play_start) if q.play_start else 0
+        q.restart_current = True
+        q.seek_to         = elapsed
+        q.voice_client.stop()
+    await interaction.response.send_message(f"🎚 EQ set to **{preset}**.")
+
+
+@bot.tree.command(name="speed", description="Set playback speed (0.5–2.0) without changing pitch")
+@app_commands.describe(value="Speed multiplier, e.g. 1.5 for 1.5× or 0.75 for 75%")
+@music_channel_only()
+@dj_only()
+async def cmd_speed(interaction: discord.Interaction, value: str):
+    try:
+        speed = float(value)
+    except ValueError:
+        return await interaction.response.send_message("❌ Invalid speed. Use a number like `1.5` or `0.75`.", ephemeral=True)
+    if not 0.25 <= speed <= 3.0:
+        return await interaction.response.send_message("❌ Speed must be between **0.25** and **3.0**.", ephemeral=True)
+    q = queues.get(interaction.guild_id)
+    if not q:
+        return await interaction.response.send_message("❌ Not connected.", ephemeral=True)
+    if q.audio_filter:
+        return await interaction.response.send_message(
+            "❌ Clear the current audio filter first (`/filter off`) before setting speed.", ephemeral=True)
+    q.speed = speed
+    if q.voice_client and q.current and (q.voice_client.is_playing() or q.voice_client.is_paused()):
+        elapsed           = int(time.monotonic() - q.play_start) if q.play_start else 0
+        q.restart_current = True
+        q.seek_to         = elapsed
+        q.voice_client.stop()
+    state = "✅ Speed reset to normal." if abs(speed - 1.0) < 0.01 else f"⏩ Speed set to **{speed:.2f}×**."
+    await interaction.response.send_message(state)
+
+
+# ---------------------------------------------------------------------------
 # Slash commands — DJ settings
 # ---------------------------------------------------------------------------
 
@@ -1498,10 +1816,8 @@ async def cmd_volume(interaction: discord.Interaction, level: int):
     q = queues.get(interaction.guild_id)
     if not q:
         return await interaction.response.send_message("❌ Not connected.", ephemeral=True)
-
     old      = q.volume
     q.volume = level / 100
-
     if (q.voice_client and q.current
             and (q.voice_client.is_playing() or q.voice_client.is_paused())
             and abs(old - q.volume) > 0.005):
@@ -1509,7 +1825,6 @@ async def cmd_volume(interaction: discord.Interaction, level: int):
         q.restart_current = True
         q.seek_to         = elapsed
         q.voice_client.stop()
-
     await interaction.response.send_message(f"🔊 Volume set to **{level}%**.")
 
 
@@ -1527,6 +1842,20 @@ async def cmd_bass(interaction: discord.Interaction):
         q.seek_to         = elapsed
         q.voice_client.stop()
     state = "🔊 **Bass boost ON**" if q.bass_boost else "🔈 **Bass boost OFF**"
+    await interaction.response.send_message(state)
+
+
+@bot.tree.command(name="autoplay", description="Toggle autoplay — keeps music going when the queue empties")
+@music_channel_only()
+@dj_only()
+async def cmd_autoplay(interaction: discord.Interaction):
+    q           = get_queue(interaction.guild_id)
+    q.autoplay  = not q.autoplay
+    state = (
+        "🔄 **Autoplay ON** — I'll find related songs when the queue empties."
+        if q.autoplay
+        else "⏹️ **Autoplay OFF**."
+    )
     await interaction.response.send_message(state)
 
 
@@ -1576,8 +1905,43 @@ async def cmd_nowplaying(interaction: discord.Interaction):
         return await interaction.response.send_message("❌ Nothing is playing.", ephemeral=True)
     view = NowPlayingView(interaction.guild_id)
     await interaction.response.send_message(
-        embed=_np_embed(q.current, q.loop_mode, q.play_start, q.bass_boost), view=view
-    )
+        embed=_np_embed(q.current, q, q.play_start), view=view)
+
+
+@bot.tree.command(name="lyrics", description="Show lyrics for the current song")
+@music_channel_only()
+async def cmd_lyrics(interaction: discord.Interaction):
+    await interaction.response.defer()
+    q = queues.get(interaction.guild_id)
+    if not q or not q.current:
+        return await interaction.followup.send("❌ Nothing is playing.", ephemeral=True)
+
+    title  = q.current.title
+    lyrics = await fetch_lyrics(title)
+    if not lyrics:
+        return await interaction.followup.send(
+            f"❌ Couldn't find lyrics for **{title}**. Try searching manually on Genius."
+        )
+
+    # Split into pages of ≤ 1800 chars each
+    chunks = []
+    while len(lyrics) > 1800:
+        split_at = lyrics.rfind("\n", 0, 1800)
+        if split_at == -1:
+            split_at = 1800
+        chunks.append(lyrics[:split_at])
+        lyrics = lyrics[split_at:].lstrip("\n")
+    if lyrics:
+        chunks.append(lyrics)
+
+    clean = _clean_title(title)
+    if len(chunks) == 1:
+        embed = discord.Embed(title=f"📜 {clean}", description=chunks[0], color=0x5865F2)
+        embed.set_footer(text="Powered by lyrics.ovh")
+        await interaction.followup.send(embed=embed)
+    else:
+        view = LyricsView(chunks, clean)
+        await interaction.followup.send(embed=view._build_embed(), view=view)
 
 
 @bot.tree.command(name="history", description="Show the last 10 songs played")
@@ -1610,6 +1974,10 @@ async def cmd_stats(interaction: discord.Interaction):
     bass         = "On"  if (q and q.bass_boost)  else "Off"
     vol          = f"{int((q.volume if q else 1.0) * 100)}%"
     loop         = LOOP_LABELS.get(q.loop_mode if q else "off", "Off")
+    autoplay     = "On"  if (q and q.autoplay)    else "Off"
+    filt         = (q.audio_filter or "None").title() if q else "None"
+    eq           = (q.eq_preset if q else "flat").title()
+    speed        = f"{q.speed:.2f}×" if q else "1.00×"
 
     embed = discord.Embed(title="📊 Bot Stats", color=0x5865F2)
     embed.add_field(name="Uptime",       value=uptime_str,        inline=True)
@@ -1619,9 +1987,94 @@ async def cmd_stats(interaction: discord.Interaction):
     embed.add_field(name="Volume",       value=vol,               inline=True)
     embed.add_field(name="Bass Boost",   value=bass,              inline=True)
     embed.add_field(name="Loop",         value=loop,              inline=True)
+    embed.add_field(name="Filter",       value=filt,              inline=True)
+    embed.add_field(name="EQ",           value=eq,                inline=True)
+    embed.add_field(name="Speed",        value=speed,             inline=True)
     embed.add_field(name="24/7 Mode",    value=mode_247,          inline=True)
+    embed.add_field(name="Autoplay",     value=autoplay,          inline=True)
     await interaction.response.send_message(embed=embed)
 
+
+# ---------------------------------------------------------------------------
+# Slash commands — Saved playlists
+# ---------------------------------------------------------------------------
+
+@bot.tree.command(name="playlist", description="Save, load, list, or delete server playlists")
+@app_commands.describe(
+    action="Action to perform",
+    name="Playlist name",
+)
+@app_commands.choices(action=[
+    app_commands.Choice(name="💾 Save current queue as a playlist", value="save"),
+    app_commands.Choice(name="▶️ Load a playlist into the queue",   value="load"),
+    app_commands.Choice(name="📋 List all saved playlists",         value="list"),
+    app_commands.Choice(name="🗑️ Delete a saved playlist",          value="delete"),
+])
+@music_channel_only()
+@dj_only()
+async def cmd_playlist(interaction: discord.Interaction,
+                        action: str, name: Optional[str] = None):
+    guild_id = interaction.guild_id
+
+    if action == "list":
+        playlists = _list_playlists(guild_id)
+        if not playlists:
+            return await interaction.response.send_message("📭 No saved playlists yet.", ephemeral=True)
+        embed = discord.Embed(title="📋 Saved Playlists", color=0x5865F2,
+                              description="\n".join(f"`{i}.` {p}" for i, p in enumerate(playlists, 1)))
+        return await interaction.response.send_message(embed=embed)
+
+    if not name:
+        return await interaction.response.send_message("❌ Provide a playlist name.", ephemeral=True)
+    # Sanitise name — only alphanumeric, dash, underscore
+    name = re.sub(r"[^\w\-]", "_", name.strip())[:32]
+    if not name:
+        return await interaction.response.send_message("❌ Invalid playlist name.", ephemeral=True)
+
+    if action == "save":
+        q = queues.get(guild_id)
+        tracks_to_save: list[Track] = []
+        if q and q.current:
+            tracks_to_save.append(q.current)
+        if q:
+            tracks_to_save.extend(list(q.tracks))
+        if not tracks_to_save:
+            return await interaction.response.send_message("❌ Nothing in the queue to save.", ephemeral=True)
+        _save_playlist(guild_id, name, tracks_to_save)
+        await interaction.response.send_message(
+            f"💾 Saved **{len(tracks_to_save)} song(s)** as playlist **{name}**."
+        )
+
+    elif action == "load":
+        await interaction.response.defer()
+        tracks = _load_playlist(guild_id, name)
+        if tracks is None:
+            return await interaction.followup.send(f"❌ No playlist named **{name}** found.", ephemeral=True)
+        q = await ensure_voice(interaction)
+        if q is None:
+            return
+        start_now = q.current is None and not q.voice_client.is_playing()
+        for t in tracks:
+            t.requested_by    = str(interaction.user)
+            t.requested_by_id = interaction.user.id
+            q.tracks.append(t)
+        if start_now and q.tracks:
+            q.current = q.tracks.popleft()
+            await _start_playing(interaction.guild, q)
+        await interaction.followup.send(
+            f"{'▶️ Starting' if start_now else '➕ Loaded'} **{len(tracks)} songs** from playlist **{name}**."
+        )
+
+    elif action == "delete":
+        if _delete_playlist(guild_id, name):
+            await interaction.response.send_message(f"🗑️ Deleted playlist **{name}**.")
+        else:
+            await interaction.response.send_message(f"❌ No playlist named **{name}** found.", ephemeral=True)
+
+
+# ---------------------------------------------------------------------------
+# Help
+# ---------------------------------------------------------------------------
 
 @bot.tree.command(name="help", description="Show all commands and tips")
 async def cmd_help(interaction: discord.Interaction):
@@ -1633,7 +2086,7 @@ async def cmd_help(interaction: discord.Interaction):
                "`/pause` `/resume` `/stop` `/replay`\n"
                "`/seek <time>` — Jump to e.g. `1:30` or `90`"), inline=False)
     embed.add_field(name="📋 Queue",
-        value=("`/queue` — Paginated queue with durations\n"
+        value=("`/queue` — Paginated queue with per-song wait times\n"
                "`/nowplaying` — Live progress bar\n"
                "`/history` — Last 10 songs\n"
                "`/skipto <pos>` `/remove <pos>` `/move <from> <to>` `/clear`"), inline=False)
@@ -1641,10 +2094,21 @@ async def cmd_help(interaction: discord.Interaction):
         value=("`/skip` — DJs skip instantly; others cast a vote\n"
                "`/loop` — Off → Song → Queue\n"
                "`/shuffle` `/volume <1-100>` `/bass`"), inline=False)
+    embed.add_field(name="🎚 Audio Effects",
+        value=("`/filter` — nightcore, vaporwave, slowed, 8d, karaoke, reverb\n"
+               "`/eq` — flat, bass, treble, pop, rock, jazz, classical\n"
+               "`/speed <0.25–3.0>` — change playback speed"), inline=False)
+    embed.add_field(name="📂 Playlists",
+        value=("`/playlist save <name>` — save the current queue\n"
+               "`/playlist load <name>` — load a saved playlist\n"
+               "`/playlist list` — show all saved playlists\n"
+               "`/playlist delete <name>` — remove a saved playlist"), inline=False)
     embed.add_field(name="⚙️ Settings",
-        value=("`/247` — Stay connected even when idle\n"
-               "`/announce` — Toggle Now Playing cards\n"
-               "`/stats` — Uptime and current settings"), inline=False)
+        value=("`/autoplay` — auto-queue related songs when queue empties\n"
+               "`/247` — stay connected forever\n"
+               "`/announce` — toggle Now Playing cards\n"
+               "`/lyrics` — show lyrics for the current song\n"
+               "`/stats` — uptime and current settings"), inline=False)
     embed.add_field(name="💡 Tips",
         value=(f"• DJ role: **{DJ_ROLE_NAME}** (server owner & admins always bypass)\n"
                f"• Max **{SONG_LIMIT}** queued songs per person\n"
