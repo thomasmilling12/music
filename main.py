@@ -6,6 +6,7 @@ import json
 import math
 import os
 import random
+import re
 import time
 import traceback
 import urllib.request
@@ -679,15 +680,47 @@ class SearchView(discord.ui.View):
 # Core playback engine
 # ---------------------------------------------------------------------------
 
+# Regex to strip common YouTube title noise before showing as activity
+_TITLE_NOISE = re.compile(
+    r"\s*[\(\[]\s*(?:"
+    r"official\s*(?:music\s*)?(?:video|audio|lyric\s*video|visualizer)?|"
+    r"lyrics?|audio|hd|hq|4k|visualizer|live\s*(?:version|performance)?|"
+    r"explicit|clean\s*version?|extended\s*(?:version|mix)?|"
+    r"radio\s*edit|full\s*version?|remastered|mv|"
+    r"\d{4}"  # year in brackets e.g. [2024]
+    r")\s*[\)\]]",
+    re.IGNORECASE,
+)
+
+
+def _clean_title(title: str) -> str:
+    """Remove common YouTube suffixes to get a cleaner song name."""
+    cleaned = _TITLE_NOISE.sub("", title).strip(" -–—|")
+    return cleaned if cleaned else title
+
+
 async def _update_presence(track: Optional[Track]) -> None:
-    """Update the bot's Discord status to show the current song (or clear it)."""
+    """Update the bot's Discord status to reflect what's playing."""
     try:
         if track:
+            # Clean title and append duration so it reads e.g. "E85 [3:42]"
+            name = _clean_title(track.title)
+            if track.duration and track.duration not in ("?:??", "Unknown"):
+                name = f"{name} [{track.duration}]"
             await bot.change_presence(
-                activity=discord.Activity(type=discord.ActivityType.listening, name=track.title)
+                activity=discord.Activity(
+                    type=discord.ActivityType.listening,
+                    name=name[:128],
+                )
             )
         else:
-            await bot.change_presence(activity=None)
+            # Show a subtle idle status instead of going blank
+            await bot.change_presence(
+                activity=discord.Activity(
+                    type=discord.ActivityType.listening,
+                    name="nothing — use /play",
+                )
+            )
     except Exception:
         pass
 
@@ -900,6 +933,16 @@ class MusicBot(commands.Bot):
 
     async def on_ready(self):
         print(f"🤖 Logged in as {self.user} (ID: {self.user.id})")
+        # Set the initial idle status so the bot always shows something
+        try:
+            await self.change_presence(
+                activity=discord.Activity(
+                    type=discord.ActivityType.listening,
+                    name="nothing — use /play",
+                )
+            )
+        except Exception:
+            pass
 
     async def on_voice_state_update(self, member: discord.Member,
                                      before: discord.VoiceState,
