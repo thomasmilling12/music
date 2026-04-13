@@ -530,6 +530,8 @@ def _effect_summary(q: GuildQueue) -> str:
         parts.append(f"🎚 {q.eq_preset.title()}")
     if q.bass_boost and not q.audio_filter:
         parts.append("🔊 Bass")
+    if abs(q.volume - 1.0) > 0.005:
+        parts.append(f"🔈 {int(q.volume * 100)}%")
     return "  ".join(parts) if parts else "None"
 
 
@@ -1028,7 +1030,16 @@ async def _start_playing(guild: discord.Guild, q: GuildQueue,
         return
 
     if not await _resolve_stream(q.current):
-        print(f"[Player] Could not resolve stream for '{q.current.title}' — skipping")
+        failed_title = q.current.title
+        print(f"[Player] Could not resolve stream for '{failed_title}' — skipping")
+        if q.text_channel:
+            try:
+                await q.text_channel.send(
+                    f"⚠️ Skipped **{failed_title}** — couldn't load the audio stream. "
+                    f"(The video may be unavailable, age-restricted, or geo-blocked.)"
+                )
+            except Exception:
+                pass
         await _play_next(guild)
         return
 
@@ -1204,7 +1215,19 @@ async def _idle_disconnect(guild: discord.Guild) -> None:
     if not q or q.mode_247:
         return
     if q.voice_client and q.voice_client.is_connected() and not q.voice_client.is_playing():
-        ch_name = q.voice_client.channel.name if q.voice_client.channel else "?"
+        ch_name      = q.voice_client.channel.name if q.voice_client.channel else "?"
+        remaining    = list(q.tracks)
+        song_count   = len(remaining)
+        autosaved    = False
+
+        # Auto-save remaining queue so nothing is lost
+        if remaining:
+            try:
+                _save_playlist(guild.id, "autosave", remaining)
+                autosaved = True
+            except Exception:
+                pass
+
         await q.voice_client.disconnect()
         text_ch = q.text_channel
         _cleanup_guild(guild.id)
@@ -1212,7 +1235,13 @@ async def _idle_disconnect(guild: discord.Guild) -> None:
         print(f"[Auto-leave] Idle timeout in #{ch_name}")
         if text_ch:
             try:
-                await text_ch.send("💤 Left the voice channel due to inactivity.")
+                msg = "💤 Left the voice channel due to inactivity."
+                if song_count > 0 and autosaved:
+                    msg += (f"\n💾 **{song_count} song(s)** still in the queue were saved as "
+                            f"playlist `autosave` — use `/playlist load autosave` to restore.")
+                elif song_count > 0:
+                    msg += f"\n⚠️ **{song_count} song(s)** were still in the queue."
+                await text_ch.send(msg)
             except Exception:
                 pass
 
@@ -2122,9 +2151,98 @@ async def cmd_playlist(interaction: discord.Interaction,
             await interaction.response.send_message(f"❌ No playlist named **{name}** found.", ephemeral=True)
 
 
+@cmd_playlist.autocomplete("name")
+async def playlist_name_autocomplete(interaction: discord.Interaction,
+                                      current: str) -> list[app_commands.Choice[str]]:
+    """Suggest saved playlist names when the user starts typing a name."""
+    playlists = _list_playlists(interaction.guild_id)
+    return [
+        app_commands.Choice(name=p, value=p)
+        for p in playlists
+        if current.lower() in p.lower()
+    ][:25]
+
+
 # ---------------------------------------------------------------------------
-# Slash commands — Extras (/back, /ping, /effects)
+# Slash commands — Extras (/np, /disconnect, /clearhistory, /update, /back, /ping, /effects)
 # ---------------------------------------------------------------------------
+
+@bot.tree.command(name="np", description="Show what's currently playing — shortcut for /nowplaying")
+@music_channel_only()
+async def cmd_np(interaction: discord.Interaction):
+    q = queues.get(interaction.guild_id)
+    if not q or q.current is None:
+        return await interaction.response.send_message("❌ Nothing is playing.", ephemeral=True)
+    view = NowPlayingView(interaction.guild_id)
+    await interaction.response.send_message(embed=_np_embed(q.current, q, q.play_start), view=view)
+
+
+@bot.tree.command(name="disconnect", description="Stop playback and disconnect (alias for /stop)")
+@music_channel_only()
+@dj_only()
+async def cmd_disconnect(interaction: discord.Interaction):
+    q = queues.get(interaction.guild_id)
+    if not q or not q.voice_client:
+        return await interaction.response.send_message("❌ Not connected.", ephemeral=True)
+    _cancel_np_tasks(q)
+    if q.idle_task:
+        q.idle_task.cancel()
+        q.idle_task = None
+    q.tracks.clear()
+    q.current         = None
+    q.restart_current = False
+    if q.voice_client.is_playing() or q.voice_client.is_paused():
+        q.voice_client.stop()
+    await q.voice_client.disconnect()
+    _cleanup_guild(interaction.guild_id)
+    asyncio.create_task(_update_presence(None))
+    await interaction.response.send_message("⏹️ Stopped and disconnected.")
+
+
+@bot.tree.command(name="clearhistory", description="Clear the recently played history")
+@music_channel_only()
+@dj_only()
+async def cmd_clearhistory(interaction: discord.Interaction):
+    q = queues.get(interaction.guild_id)
+    if not q or not q.history:
+        return await interaction.response.send_message("📭 No history to clear.", ephemeral=True)
+    count = len(q.history)
+    q.history.clear()
+    await interaction.response.send_message(f"🗑️ Cleared **{count}** song(s) from history.")
+
+
+@bot.tree.command(name="update", description="Update yt-dlp to the latest version — fixes YouTube issues")
+@music_channel_only()
+@dj_only()
+async def cmd_update(interaction: discord.Interaction):
+    await interaction.response.defer()
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            "pip", "install", "-U", "yt-dlp",
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=60)
+        output = (stdout or b"").decode().strip()
+
+        if "Successfully installed" in output:
+            match = re.search(r"yt-dlp-([\d\.]+)", output)
+            version = match.group(1) if match else "latest"
+            await interaction.followup.send(
+                f"✅ yt-dlp updated to **{version}**. Restart the bot to apply the update."
+            )
+        elif "already" in output.lower():
+            import yt_dlp as _yt
+            current_ver = getattr(_yt.version, "__version__", "unknown")
+            await interaction.followup.send(f"✅ yt-dlp is already up to date (v{current_ver}).")
+        else:
+            snippet = output[:400] if output else "No output."
+            await interaction.followup.send(f"✅ Update ran.\n```\n{snippet}\n```")
+    except asyncio.TimeoutError:
+        await interaction.followup.send("❌ Update timed out after 60 seconds.")
+    except Exception as e:
+        await interaction.followup.send(f"❌ Update failed: `{e}`")
+
 
 @bot.tree.command(name="back", description="Go back to the previous song")
 @music_channel_only()
@@ -2226,8 +2344,12 @@ async def cmd_help(interaction: discord.Interaction):
                "`/247` — stay connected forever\n"
                "`/announce` — toggle Now Playing cards\n"
                "`/lyrics` — show lyrics for the current song\n"
+               "`/np` — quick shortcut for /nowplaying\n"
                "`/back` — go back to the previous song\n"
+               "`/disconnect` — stop and disconnect (alias for /stop)\n"
+               "`/clearhistory` — wipe the recently played list\n"
                "`/effects` — see all active audio effects at a glance\n"
+               "`/update` — update yt-dlp to fix YouTube issues\n"
                "`/ping` — check bot latency\n"
                "`/stats` — uptime and current settings"), inline=False)
     embed.add_field(name="💡 Tips",
