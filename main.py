@@ -180,12 +180,14 @@ def fmt_dur(seconds) -> str:
     return f"{h}:{m:02d}:{sec:02d}" if h else f"{m}:{sec:02d}"
 
 
-def progress_bar(elapsed: int, total: int, width: int = 14) -> str:
+def progress_bar(elapsed: int, total: int, width: int = 17) -> str:
+    """Spotify-style progress bar: 0:31 ━━━━●──────── 3:17"""
     if not total:
         return ""
     ratio  = min(elapsed / total, 1.0)
-    filled = round(ratio * width)
-    return f"`{'▓' * filled}{'░' * (width - filled)}` {fmt_dur(elapsed)} / {fmt_dur(total)}"
+    dot_pos = round(ratio * width)
+    bar = "━" * dot_pos + "●" + "─" * (width - dot_pos)
+    return f"`{fmt_dur(elapsed)}` {bar} `{fmt_dur(total)}`"
 
 
 def parse_time(s: str) -> Optional[int]:
@@ -543,10 +545,8 @@ def _np_embed(track: Track, q: GuildQueue,
         color       = 0x5865F2,
     )
     if play_start and track.duration_secs:
-        elapsed   = max(0, min(int(time.monotonic() - play_start), track.duration_secs))
-        remaining = track.duration_secs - elapsed
-        embed.add_field(name="Progress",  value=progress_bar(elapsed, track.duration_secs), inline=False)
-        embed.add_field(name="Remaining", value=fmt_dur(remaining), inline=True)
+        elapsed = max(0, min(int(time.monotonic() - play_start), track.duration_secs))
+        embed.add_field(name="\u200b", value=progress_bar(elapsed, track.duration_secs), inline=False)
     else:
         embed.add_field(name="Duration", value=track.duration, inline=True)
 
@@ -996,16 +996,34 @@ def _clean_title(title: str) -> str:
 
 async def _update_presence(track: Optional[Track], is_playing: bool = False) -> None:
     """Update the bot's Discord status.
-    While playing: purple streaming dot + song title [duration].
+    While playing: 'Listening to [song]' with artist + duration (Spotify-style).
     When idle: yellow idle dot with a prompt."""
     try:
         if track and is_playing:
-            name = _clean_title(track.title)
-            if track.duration and track.duration not in ("?:??", "Unknown"):
-                name = f"{name} [{track.duration}]"
+            title  = _clean_title(track.title)
+            # Extract artist — everything before the first ' - ' if present
+            if " - " in title:
+                artist, song = title.split(" - ", 1)
+            else:
+                artist, song = None, title
+
+            dur_str = track.duration if track.duration not in ("?:??", "Unknown", None) else None
+
+            # Build state line: artist • duration, or just whichever is available
+            state_parts = []
+            if artist:
+                state_parts.append(artist.strip())
+            if dur_str:
+                state_parts.append(dur_str)
+            state_line = " • ".join(state_parts) or None
+
             await bot.change_presence(
-                status   = discord.Status.do_not_disturb,
-                activity = discord.Streaming(name=name[:128], url=TWITCH_URL),
+                status   = discord.Status.online,
+                activity = discord.Activity(
+                    type    = discord.ActivityType.listening,
+                    name    = song.strip()[:128],
+                    details = state_line,
+                ),
             )
         else:
             await bot.change_presence(
