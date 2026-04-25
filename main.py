@@ -141,6 +141,8 @@ class GuildQueue:
     # Live Now Playing embed tracking
     np_message:      Optional[discord.Message]     = None
     np_update_task:  Optional[asyncio.Task]        = None
+    # Reconnect guard — prevents duplicate _handle_voice_drop tasks
+    reconnecting:    bool                          = False
 
 
 # Global state
@@ -1169,10 +1171,17 @@ async def _play_next(guild: discord.Guild) -> None:
 
 
 async def _handle_voice_drop(guild: discord.Guild) -> None:
-    """Handle voice WebSocket disconnects. Attempts reconnect up to 3 times."""
+    """Handle voice WebSocket disconnects. Attempts reconnect up to 3 times.
+    Guards against being triggered multiple times for the same disconnect event."""
     q = queues.get(guild.id)
     if not q:
         return
+
+    # Prevent duplicate tasks from piling up — only one reconnect at a time
+    if q.reconnecting:
+        print(f"[Voice] Drop ignored in {guild.name} — reconnect already in progress")
+        return
+    q.reconnecting = True
 
     channel = q.voice_client.channel if q.voice_client else None
     elapsed = int(time.monotonic() - q.play_start) if q.play_start else 0
@@ -1186,44 +1195,53 @@ async def _handle_voice_drop(guild: discord.Guild) -> None:
         q.idle_task = None
 
     reconnected = False
-    for attempt in range(1, 4):
-        await asyncio.sleep(5 * attempt)
-        if not channel or not any(not m.bot for m in channel.members):
-            print("[Voice] Channel empty — stopping reconnect")
-            break
-        try:
-            existing = guild.voice_client
-            if existing:
+    try:
+        for attempt in range(1, 4):
+            await asyncio.sleep(5 * attempt)
+            # Re-fetch q in case it was cleaned up while we waited
+            q = queues.get(guild.id)
+            if not q:
+                return
+            if not channel or not any(not m.bot for m in channel.members):
+                print("[Voice] Channel empty — stopping reconnect")
+                break
+            try:
+                existing = guild.voice_client
+                if existing:
+                    try:
+                        await asyncio.wait_for(existing.disconnect(force=True), timeout=5)
+                    except Exception:
+                        pass
+                vc = await asyncio.wait_for(channel.connect(reconnect=False), timeout=15)
+                q.voice_client = vc
+                reconnected    = True
+                print(f"[Voice] Reconnected on attempt {attempt}")
+                break
+            except Exception as e:
+                print(f"[Voice] Reconnect attempt {attempt} failed: {e}")
+
+        if reconnected and q.current:
+            q.restart_current = True
+            q.seek_to         = elapsed
+            asyncio.create_task(_play_next(guild))
+            if q.text_channel:
                 try:
-                    await asyncio.wait_for(existing.disconnect(force=True), timeout=5)
+                    await q.text_channel.send("🔄 Reconnected — resuming playback.")
                 except Exception:
                     pass
-            vc = await asyncio.wait_for(channel.connect(reconnect=False), timeout=15)
-            q.voice_client = vc
-            reconnected    = True
-            print(f"[Voice] Reconnected on attempt {attempt}")
-            break
-        except Exception as e:
-            print(f"[Voice] Reconnect attempt {attempt} failed: {e}")
-
-    if reconnected and q.current:
-        q.restart_current = True
-        q.seek_to         = elapsed
-        asyncio.create_task(_play_next(guild))
-        if q.text_channel:
-            try:
-                await q.text_channel.send("🔄 Reconnected — resuming playback.")
-            except Exception:
-                pass
-    else:
-        q.current    = None
-        q.play_start = None
-        asyncio.create_task(_update_presence(None))
-        if q.text_channel:
-            try:
-                await q.text_channel.send("⚠️ Voice connection lost. Use `/play` to resume.")
-            except Exception:
-                pass
+        else:
+            q.current    = None
+            q.play_start = None
+            asyncio.create_task(_update_presence(None))
+            if q.text_channel:
+                try:
+                    await q.text_channel.send("⚠️ Voice connection lost. Use `/play` to resume.")
+                except Exception:
+                    pass
+    finally:
+        # Always clear the flag so future genuine disconnects are handled
+        if q := queues.get(guild.id):
+            q.reconnecting = False
 
 
 async def _idle_disconnect(guild: discord.Guild) -> None:
@@ -1302,7 +1320,7 @@ class MusicBot(commands.Bot):
         if member.bot and member.id == self.user.id:
             if before.channel and not after.channel:
                 q = queues.get(guild.id)
-                if q and q.voice_client:
+                if q and q.voice_client and not q.reconnecting:
                     print(f"[Voice] Bot force-disconnected from #{before.channel.name}")
                     asyncio.create_task(_handle_voice_drop(guild))
             return
