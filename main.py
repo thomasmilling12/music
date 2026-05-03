@@ -143,6 +143,8 @@ class GuildQueue:
     np_update_task:  Optional[asyncio.Task]        = None
     # Reconnect guard — prevents duplicate _handle_voice_drop tasks
     reconnecting:    bool                          = False
+    # Pre-fetch task — fetches next song's stream URL in the background
+    prefetch_task:   Optional[asyncio.Task]        = None
 
 
 # Global state
@@ -712,11 +714,14 @@ async def _np_updater(guild_id: int, track: Track) -> None:
 
 
 def _cancel_np_tasks(q: GuildQueue) -> None:
-    """Cancel the live NP updater task and clear the tracked message."""
+    """Cancel the live NP updater task, prefetch task, and clear the tracked message."""
     if q.np_update_task and not q.np_update_task.done():
         q.np_update_task.cancel()
     q.np_update_task = None
     q.np_message     = None
+    if q.prefetch_task and not q.prefetch_task.done():
+        q.prefetch_task.cancel()
+    q.prefetch_task = None
 
 
 def _register_np(q: GuildQueue, msg: discord.Message, track: Track, guild_id: int) -> None:
@@ -809,6 +814,48 @@ class NowPlayingView(discord.ui.View):
         random.shuffle(lst)
         q.tracks = deque(lst)
         await interaction.response.send_message("🔀 Queue shuffled!", ephemeral=True)
+
+    @discord.ui.button(emoji="🔉", style=discord.ButtonStyle.secondary, custom_id="np_vol_down", row=1)
+    async def vol_down(self, interaction: discord.Interaction, button: discord.ui.Button):
+        q = self._q()
+        if not q:
+            return await interaction.response.send_message("❌ Not connected.", ephemeral=True)
+        if not _same_vc(interaction, q):
+            return await interaction.response.send_message("❌ Join my voice channel first.", ephemeral=True)
+        if not has_dj_role(interaction.user):
+            return await interaction.response.send_message(
+                f"❌ You need the **{DJ_ROLE_NAME}** role.", ephemeral=True)
+        new_vol = max(0.1, q.volume - 0.1)
+        if abs(new_vol - q.volume) < 0.005:
+            return await interaction.response.send_message("🔇 Already at minimum volume.", ephemeral=True)
+        q.volume = new_vol
+        if q.voice_client and q.current and (q.voice_client.is_playing() or q.voice_client.is_paused()):
+            elapsed       = int(time.monotonic() - q.play_start) if q.play_start else 0
+            q.restart_current = True
+            q.seek_to         = elapsed
+            q.voice_client.stop()
+        await interaction.response.send_message(f"🔉 Volume → **{int(new_vol * 100)}%**", ephemeral=True)
+
+    @discord.ui.button(emoji="🔊", style=discord.ButtonStyle.secondary, custom_id="np_vol_up", row=1)
+    async def vol_up(self, interaction: discord.Interaction, button: discord.ui.Button):
+        q = self._q()
+        if not q:
+            return await interaction.response.send_message("❌ Not connected.", ephemeral=True)
+        if not _same_vc(interaction, q):
+            return await interaction.response.send_message("❌ Join my voice channel first.", ephemeral=True)
+        if not has_dj_role(interaction.user):
+            return await interaction.response.send_message(
+                f"❌ You need the **{DJ_ROLE_NAME}** role.", ephemeral=True)
+        new_vol = min(2.0, q.volume + 0.1)
+        if abs(new_vol - q.volume) < 0.005:
+            return await interaction.response.send_message("🔊 Already at maximum volume (200%).", ephemeral=True)
+        q.volume = new_vol
+        if q.voice_client and q.current and (q.voice_client.is_playing() or q.voice_client.is_paused()):
+            elapsed       = int(time.monotonic() - q.play_start) if q.play_start else 0
+            q.restart_current = True
+            q.seek_to         = elapsed
+            q.voice_client.stop()
+        await interaction.response.send_message(f"🔊 Volume → **{int(new_vol * 100)}%**", ephemeral=True)
 
 
 # ---------------------------------------------------------------------------
@@ -1093,6 +1140,12 @@ async def _start_playing(guild: discord.Guild, q: GuildQueue,
     print(f"[Player] ▶ {q.current.title}")
     asyncio.create_task(_update_presence(q.current, is_playing=True))
 
+    # Pre-fetch the next song's stream URL in the background to reduce inter-track gap
+    if q.prefetch_task:
+        q.prefetch_task.cancel()
+    if q.tracks:
+        q.prefetch_task = asyncio.create_task(_prefetch_next(q))
+
     _cancel_np_tasks(q)
 
     if send_np and q.announce and q.text_channel and seek_secs == 0:
@@ -1105,6 +1158,36 @@ async def _start_playing(guild: discord.Guild, q: GuildQueue,
             _register_np(q, msg, q.current, guild.id)
         except Exception as e:
             print(f"[Player] Could not send Now Playing card: {e}")
+
+
+async def _prefetch_next(q: GuildQueue) -> None:
+    """After a short delay, pre-fetch the stream URL for the next queued track
+    so there's no gap when the current song ends."""
+    await asyncio.sleep(20)          # let the current song settle first
+    if not q.tracks:
+        return
+    next_track = q.tracks[0]
+    if next_track.stream_url:        # already fetched
+        return
+    try:
+        loop = asyncio.get_event_loop()
+        ydl_opts = {
+            "format":          "bestaudio/best",
+            "quiet":           True,
+            "no_warnings":     True,
+            "noplaylist":      True,
+        }
+        def _fetch():
+            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                info = ydl.extract_info(next_track.webpage_url, download=False)
+                return info.get("url") if info else None
+        url = await loop.run_in_executor(None, _fetch)
+        if url:
+            next_track.stream_url = url
+            next_track.fetched_at = time.monotonic()
+            print(f"[Prefetch] ✓ Pre-fetched stream for '{next_track.title}'")
+    except Exception as e:
+        print(f"[Prefetch] Failed for '{next_track.title}': {e}")
 
 
 async def _play_next(guild: discord.Guild) -> None:
@@ -1184,7 +1267,12 @@ async def _handle_voice_drop(guild: discord.Guild) -> None:
     q.reconnecting = True
 
     channel = q.voice_client.channel if q.voice_client else None
-    elapsed = int(time.monotonic() - q.play_start) if q.play_start else 0
+    now     = time.monotonic()
+    elapsed = int(now - q.play_start) if q.play_start else 0
+    # Subtract time the player was paused so we resume at the right position
+    if q.paused_at:
+        elapsed -= int(now - q.paused_at)
+    elapsed = max(0, elapsed)
     if q.current and q.current.duration_secs:
         elapsed = min(elapsed, q.current.duration_secs)
 
@@ -1256,10 +1344,15 @@ async def _idle_disconnect(guild: discord.Guild) -> None:
         song_count   = len(remaining)
         autosaved    = False
 
-        # Auto-save remaining queue so nothing is lost
+        # Auto-save remaining queue so nothing is lost — use a timestamped name
+        # so repeated idle disconnects never silently overwrite each other
+        save_name = None
         if remaining:
             try:
-                _save_playlist(guild.id, "autosave", remaining)
+                import datetime
+                stamp     = datetime.datetime.now().strftime("%m%d_%H%M")
+                save_name = f"autosave_{stamp}"
+                _save_playlist(guild.id, save_name, remaining)
                 autosaved = True
             except Exception:
                 pass
@@ -1273,10 +1366,10 @@ async def _idle_disconnect(guild: discord.Guild) -> None:
             try:
                 msg = "💤 Left the voice channel due to inactivity."
                 if song_count > 0 and autosaved:
-                    msg += (f"\n💾 **{song_count} song(s)** still in the queue were saved as "
-                            f"playlist `autosave` — use `/playlist load autosave` to restore.")
+                    msg += (f"\n💾 **{song_count} song(s)** saved as playlist `{save_name}` "
+                            f"— use `/playlist load {save_name}` to restore.")
                 elif song_count > 0:
-                    msg += f"\n⚠️ **{song_count} song(s)** were still in the queue."
+                    msg += f"\n⚠️ **{song_count} song(s)** were still in the queue but could not be saved."
                 await text_ch.send(msg)
             except Exception:
                 pass
@@ -2081,9 +2174,13 @@ async def cmd_stats(interaction: discord.Interaction):
     m, s   = divmod(rem, 60)
     uptime_str = f"{h}h {m}m {s}s" if h else f"{m}m {s}s"
 
+    latency_ms = round(bot.latency * 1000)
+
     q            = queues.get(interaction.guild_id)
     songs_played = q.songs_played if q else 0
     in_queue     = len(q.tracks)  if q else 0
+    queue_secs   = sum(t.duration_secs or 0 for t in q.tracks) if q else 0
+    queue_str    = f"{in_queue} song(s)" + (f" · {fmt_dur(queue_secs)}" if queue_secs else "")
     current      = q.current.title if q and q.current else "Nothing"
     mode_247     = "On"  if (q and q.mode_247)   else "Off"
     bass         = "On"  if (q and q.bass_boost)  else "Off"
@@ -2095,18 +2192,19 @@ async def cmd_stats(interaction: discord.Interaction):
     speed        = f"{q.speed:.2f}×" if q else "1.00×"
 
     embed = discord.Embed(title="📊 Bot Stats", color=0x5865F2)
-    embed.add_field(name="Uptime",       value=uptime_str,        inline=True)
-    embed.add_field(name="Songs Played", value=str(songs_played), inline=True)
-    embed.add_field(name="In Queue",     value=str(in_queue),     inline=True)
-    embed.add_field(name="Now Playing",  value=current,           inline=False)
-    embed.add_field(name="Volume",       value=vol,               inline=True)
-    embed.add_field(name="Bass Boost",   value=bass,              inline=True)
-    embed.add_field(name="Loop",         value=loop,              inline=True)
-    embed.add_field(name="Filter",       value=filt,              inline=True)
-    embed.add_field(name="EQ",           value=eq,                inline=True)
-    embed.add_field(name="Speed",        value=speed,             inline=True)
-    embed.add_field(name="24/7 Mode",    value=mode_247,          inline=True)
-    embed.add_field(name="Autoplay",     value=autoplay,          inline=True)
+    embed.add_field(name="Uptime",        value=uptime_str,        inline=True)
+    embed.add_field(name="Ping",          value=f"{latency_ms} ms", inline=True)
+    embed.add_field(name="Songs Played",  value=str(songs_played), inline=True)
+    embed.add_field(name="Now Playing",   value=current,           inline=False)
+    embed.add_field(name="Queue",         value=queue_str,         inline=True)
+    embed.add_field(name="Volume",        value=vol,               inline=True)
+    embed.add_field(name="Loop",          value=loop,              inline=True)
+    embed.add_field(name="Filter",        value=filt,              inline=True)
+    embed.add_field(name="EQ",            value=eq,                inline=True)
+    embed.add_field(name="Speed",         value=speed,             inline=True)
+    embed.add_field(name="Bass Boost",    value=bass,              inline=True)
+    embed.add_field(name="24/7 Mode",     value=mode_247,          inline=True)
+    embed.add_field(name="Autoplay",      value=autoplay,          inline=True)
     await interaction.response.send_message(embed=embed)
 
 
