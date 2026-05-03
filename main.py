@@ -105,9 +105,10 @@ class Track:
     duration_secs:   Optional[int]
     thumbnail:       str
     requested_by:    str
-    requested_by_id: int   = 0
+    requested_by_id:  int   = 0
+    requester_avatar: str   = ""
     # Timestamp when the stream URL was fetched — used for TTL expiry checks
-    fetched_at:      float = field(default_factory=time.monotonic)
+    fetched_at:       float = field(default_factory=time.monotonic)
 
 
 @dataclass
@@ -144,7 +145,9 @@ class GuildQueue:
     # Reconnect guard — prevents duplicate _handle_voice_drop tasks
     reconnecting:    bool                          = False
     # Pre-fetch task — fetches next song's stream URL in the background
-    prefetch_task:   Optional[asyncio.Task]        = None
+    prefetch_task:      Optional[asyncio.Task]     = None
+    # Accumulated playback time this session (seconds)
+    session_listen_secs: int                       = 0
 
 
 # Global state
@@ -543,18 +546,23 @@ def _effect_summary(q: GuildQueue) -> str:
 
 def _np_embed(track: Track, q: GuildQueue,
               play_start: Optional[float] = None) -> discord.Embed:
+    queue_len  = len(q.tracks)
+    queue_note = f"{queue_len} more in queue" if queue_len else "Last song"
     embed = discord.Embed(
-        title       = "🎵 Now Playing",
+        title       = f"🎵 Now Playing  ·  {queue_note}",
         description = f"**[{track.title}]({track.webpage_url})**",
         color       = 0x5865F2,
     )
     if play_start and track.duration_secs:
-        elapsed = max(0, min(int(time.monotonic() - play_start), track.duration_secs))
+        now     = time.monotonic()
+        elapsed = int(now - play_start)
+        if q.paused_at:
+            elapsed -= int(now - q.paused_at)
+        elapsed = max(0, min(elapsed, track.duration_secs))
         embed.add_field(name="\u200b", value=progress_bar(elapsed, track.duration_secs), inline=False)
     else:
         embed.add_field(name="Duration", value=track.duration, inline=True)
 
-    embed.add_field(name="Requested by", value=track.requested_by, inline=True)
     loop_val = LOOP_LABELS.get(q.loop_mode, "Off")
     embed.add_field(name="Loop", value=loop_val, inline=True)
 
@@ -563,6 +571,11 @@ def _np_embed(track: Track, q: GuildQueue,
 
     if track.thumbnail:
         embed.set_thumbnail(url=track.thumbnail)
+    footer_text = f"Requested by {track.requested_by}"
+    if track.requester_avatar:
+        embed.set_footer(text=footer_text, icon_url=track.requester_avatar)
+    else:
+        embed.set_footer(text=footer_text)
     return embed
 
 
@@ -749,6 +762,10 @@ class NowPlayingView(discord.ui.View):
     def __init__(self, guild_id: int):
         super().__init__(timeout=None)
         self.guild_id = guild_id
+        # Reflect current paused state so the icon is correct after bot restarts
+        q = queues.get(guild_id)
+        if q and q.voice_client and q.voice_client.is_paused():
+            self.pause_resume.emoji = "▶️"
 
     def _q(self) -> Optional[GuildQueue]:
         return queues.get(self.guild_id)
@@ -815,7 +832,50 @@ class NowPlayingView(discord.ui.View):
         q.tracks = deque(lst)
         await interaction.response.send_message("🔀 Queue shuffled!", ephemeral=True)
 
-    @discord.ui.button(emoji="🔉", style=discord.ButtonStyle.secondary, custom_id="np_vol_down", row=1)
+    @discord.ui.button(emoji="⏪", style=discord.ButtonStyle.secondary, custom_id="np_seek_back", row=1)
+    async def seek_back(self, interaction: discord.Interaction, button: discord.ui.Button):
+        q = self._q()
+        if not q or not q.current:
+            return await interaction.response.send_message("❌ Nothing is playing.", ephemeral=True)
+        if not _same_vc(interaction, q):
+            return await interaction.response.send_message("❌ Join my voice channel first.", ephemeral=True)
+        if not has_dj_role(interaction.user):
+            return await interaction.response.send_message(
+                f"❌ You need the **{DJ_ROLE_NAME}** role.", ephemeral=True)
+        now     = time.monotonic()
+        elapsed = int(now - q.play_start) if q.play_start else 0
+        if q.paused_at:
+            elapsed -= int(now - q.paused_at)
+        new_pos = max(0, elapsed - 30)
+        q.restart_current = True
+        q.seek_to         = new_pos
+        if q.voice_client and (q.voice_client.is_playing() or q.voice_client.is_paused()):
+            q.voice_client.stop()
+        await interaction.response.send_message(f"⏪ Back 30s → `{fmt_dur(new_pos)}`", ephemeral=True)
+
+    @discord.ui.button(emoji="⏩", style=discord.ButtonStyle.secondary, custom_id="np_seek_fwd", row=1)
+    async def seek_fwd(self, interaction: discord.Interaction, button: discord.ui.Button):
+        q = self._q()
+        if not q or not q.current:
+            return await interaction.response.send_message("❌ Nothing is playing.", ephemeral=True)
+        if not _same_vc(interaction, q):
+            return await interaction.response.send_message("❌ Join my voice channel first.", ephemeral=True)
+        if not has_dj_role(interaction.user):
+            return await interaction.response.send_message(
+                f"❌ You need the **{DJ_ROLE_NAME}** role.", ephemeral=True)
+        now     = time.monotonic()
+        elapsed = int(now - q.play_start) if q.play_start else 0
+        if q.paused_at:
+            elapsed -= int(now - q.paused_at)
+        dur     = q.current.duration_secs or 0
+        new_pos = min(elapsed + 30, max(0, dur - 2))
+        q.restart_current = True
+        q.seek_to         = new_pos
+        if q.voice_client and (q.voice_client.is_playing() or q.voice_client.is_paused()):
+            q.voice_client.stop()
+        await interaction.response.send_message(f"⏩ Forward 30s → `{fmt_dur(new_pos)}`", ephemeral=True)
+
+    @discord.ui.button(emoji="🔉", style=discord.ButtonStyle.secondary, custom_id="np_vol_down", row=2)
     async def vol_down(self, interaction: discord.Interaction, button: discord.ui.Button):
         q = self._q()
         if not q:
@@ -883,9 +943,21 @@ class QueueView(discord.ui.View):
     def _build_embed(self) -> discord.Embed:
         lines = []
         if self.q.current and self.page == 0:
+            # Show live progress inline for the current song
+            if self.q.play_start and self.q.current.duration_secs:
+                now     = time.monotonic()
+                elapsed = int(now - self.q.play_start)
+                if self.q.paused_at:
+                    elapsed -= int(now - self.q.paused_at)
+                elapsed  = max(0, min(elapsed, self.q.current.duration_secs))
+                progress = f"`{fmt_dur(elapsed)}/{self.q.current.duration}`"
+                status   = "⏸️" if self.q.voice_client and self.q.voice_client.is_paused() else "▶️"
+            else:
+                progress = f"`{self.q.current.duration}`"
+                status   = "▶️"
             lines.append(
-                f"**▶️ Now Playing:** [{self.q.current.title}]({self.q.current.webpage_url}) "
-                f"`{self.q.current.duration}` — {self.q.current.requested_by}"
+                f"**{status} Now Playing:** [{self.q.current.title}]({self.q.current.webpage_url}) "
+                f"{progress} — {self.q.current.requested_by}"
             )
 
         lst   = list(self.q.tracks)
@@ -1214,10 +1286,18 @@ async def _play_next(guild: discord.Guild) -> None:
             await _start_playing(guild, q)
             return
 
-        # Archive finished track
+        # Archive finished track and accumulate session listening time
         if q.current:
             q.history.append(q.current)
             q.songs_played += 1
+            if q.play_start:
+                listened = int(time.monotonic() - q.play_start)
+                if q.paused_at:
+                    listened -= int(time.monotonic() - q.paused_at)
+                listened = max(0, listened)
+                if q.current.duration_secs:
+                    listened = min(listened, q.current.duration_secs)
+                q.session_listen_secs += listened
 
         # Loop queue
         if q.loop_mode == "queue" and q.current:
@@ -1608,6 +1688,7 @@ async def cmd_play(interaction: discord.Interaction, query: str):
             return await interaction.followup.send("❌ Couldn't find that song. Try a different search.")
         if isinstance(track, str):
             return await interaction.followup.send(track)
+        track.requester_avatar = str(interaction.user.display_avatar.url)
 
         if q.voice_client.is_playing() or q.voice_client.is_paused() or q.current is not None:
             q.tracks.append(track)
@@ -1652,6 +1733,7 @@ async def cmd_playnext(interaction: discord.Interaction, query: str):
         return await interaction.followup.send("❌ Couldn't find that song.")
     if isinstance(track, str):
         return await interaction.followup.send(track)
+    track.requester_avatar = str(interaction.user.display_avatar.url)
     q.tracks.appendleft(track)
     embed = discord.Embed(title="⏫ Playing Next",
                           description=f"**[{track.title}]({track.webpage_url})**",
@@ -1667,6 +1749,94 @@ async def playnext_autocomplete(interaction: discord.Interaction, current: str):
     if not current or len(current) < 2:
         return []
     return await _search_suggestions(current)
+
+
+@bot.tree.command(name="playtop", description="Add a song to the very top of the queue (plays next)")
+@app_commands.describe(query="Song name or YouTube / Spotify URL")
+@music_channel_only()
+@dj_only()
+async def cmd_playtop(interaction: discord.Interaction, query: str):
+    """Alias for /playnext — kept for discoverability."""
+    await interaction.response.defer()
+    q = await ensure_voice(interaction)
+    if q is None:
+        return
+    track = await fetch_track(query, str(interaction.user), interaction.user.id)
+    if track is None:
+        return await interaction.followup.send("❌ Couldn't find that song.")
+    if isinstance(track, str):
+        return await interaction.followup.send(track)
+    track.requester_avatar = str(interaction.user.display_avatar.url)
+    q.tracks.appendleft(track)
+    embed = discord.Embed(title="⏫ Added to Top of Queue",
+                          description=f"**[{track.title}]({track.webpage_url})**",
+                          color=0x5865F2)
+    embed.add_field(name="Duration", value=track.duration, inline=True)
+    if track.thumbnail:
+        embed.set_thumbnail(url=track.thumbnail)
+    await interaction.followup.send(embed=embed)
+
+
+@cmd_playtop.autocomplete("query")
+async def playtop_autocomplete(interaction: discord.Interaction, current: str):
+    if not current or len(current) < 2:
+        return []
+    return await _search_suggestions(current)
+
+
+@bot.tree.command(name="removeduplicates", description="Remove duplicate songs from the queue")
+@music_channel_only()
+@dj_only()
+async def cmd_removeduplicates(interaction: discord.Interaction):
+    q = queues.get(interaction.guild_id)
+    if not q or not q.tracks:
+        return await interaction.response.send_message("❌ The queue is empty.", ephemeral=True)
+    before = len(q.tracks)
+    seen   = set()
+    unique = deque()
+    for t in q.tracks:
+        key = t.webpage_url
+        if key not in seen:
+            seen.add(key)
+            unique.append(t)
+    q.tracks  = unique
+    removed   = before - len(q.tracks)
+    if removed == 0:
+        await interaction.response.send_message("✅ No duplicates found — queue is already clean.")
+    else:
+        await interaction.response.send_message(
+            f"🧹 Removed **{removed}** duplicate(s). Queue now has **{len(q.tracks)}** song(s).")
+
+
+@bot.tree.command(name="exportqueue", description="Print the full queue as a shareable list")
+@music_channel_only()
+async def cmd_exportqueue(interaction: discord.Interaction):
+    q = queues.get(interaction.guild_id)
+    if not q or (q.current is None and not q.tracks):
+        return await interaction.response.send_message("📭 The queue is empty.", ephemeral=True)
+    lines = []
+    if q.current:
+        lines.append(f"▶️ **Now Playing:** {q.current.title} `{q.current.duration}` — {q.current.requested_by}")
+    for i, t in enumerate(q.tracks, 1):
+        lines.append(f"`{i}.` {t.title} `{t.duration}` — {t.requested_by}")
+    total_secs = sum(t.duration_secs or 0 for t in q.tracks)
+    header     = f"🎵 **Queue Export** — {len(q.tracks)} song(s)"
+    if total_secs:
+        header += f" · {fmt_dur(total_secs)} remaining"
+    # Discord messages cap at 2000 chars — split into chunks if needed
+    chunks  = []
+    current = header
+    for line in lines:
+        candidate = current + "\n" + line
+        if len(candidate) > 1900:
+            chunks.append(current)
+            current = line
+        else:
+            current = candidate
+    chunks.append(current)
+    await interaction.response.send_message(chunks[0])
+    for chunk in chunks[1:]:
+        await interaction.followup.send(chunk)
 
 
 @bot.tree.command(name="search", description="Search YouTube and pick from 5 results")
@@ -2176,35 +2346,38 @@ async def cmd_stats(interaction: discord.Interaction):
 
     latency_ms = round(bot.latency * 1000)
 
-    q            = queues.get(interaction.guild_id)
-    songs_played = q.songs_played if q else 0
-    in_queue     = len(q.tracks)  if q else 0
-    queue_secs   = sum(t.duration_secs or 0 for t in q.tracks) if q else 0
-    queue_str    = f"{in_queue} song(s)" + (f" · {fmt_dur(queue_secs)}" if queue_secs else "")
-    current      = q.current.title if q and q.current else "Nothing"
-    mode_247     = "On"  if (q and q.mode_247)   else "Off"
-    bass         = "On"  if (q and q.bass_boost)  else "Off"
-    vol          = f"{int((q.volume if q else 1.0) * 100)}%"
-    loop         = LOOP_LABELS.get(q.loop_mode if q else "off", "Off")
-    autoplay     = "On"  if (q and q.autoplay)    else "Off"
-    filt         = (q.audio_filter or "None").title() if q else "None"
-    eq           = (q.eq_preset if q else "flat").title()
-    speed        = f"{q.speed:.2f}×" if q else "1.00×"
+    q              = queues.get(interaction.guild_id)
+    songs_played   = q.songs_played if q else 0
+    in_queue       = len(q.tracks)  if q else 0
+    queue_secs     = sum(t.duration_secs or 0 for t in q.tracks) if q else 0
+    queue_str      = f"{in_queue} song(s)" + (f" · {fmt_dur(queue_secs)}" if queue_secs else "")
+    listen_secs    = q.session_listen_secs if q else 0
+    listen_str     = fmt_dur(listen_secs) if listen_secs else "0:00"
+    current        = q.current.title if q and q.current else "Nothing"
+    mode_247       = "On"  if (q and q.mode_247)   else "Off"
+    bass           = "On"  if (q and q.bass_boost)  else "Off"
+    vol            = f"{int((q.volume if q else 1.0) * 100)}%"
+    loop           = LOOP_LABELS.get(q.loop_mode if q else "off", "Off")
+    autoplay       = "On"  if (q and q.autoplay)    else "Off"
+    filt           = (q.audio_filter or "None").title() if q else "None"
+    eq             = (q.eq_preset if q else "flat").title()
+    speed          = f"{q.speed:.2f}×" if q else "1.00×"
 
     embed = discord.Embed(title="📊 Bot Stats", color=0x5865F2)
-    embed.add_field(name="Uptime",        value=uptime_str,        inline=True)
-    embed.add_field(name="Ping",          value=f"{latency_ms} ms", inline=True)
-    embed.add_field(name="Songs Played",  value=str(songs_played), inline=True)
-    embed.add_field(name="Now Playing",   value=current,           inline=False)
-    embed.add_field(name="Queue",         value=queue_str,         inline=True)
-    embed.add_field(name="Volume",        value=vol,               inline=True)
-    embed.add_field(name="Loop",          value=loop,              inline=True)
-    embed.add_field(name="Filter",        value=filt,              inline=True)
-    embed.add_field(name="EQ",            value=eq,                inline=True)
-    embed.add_field(name="Speed",         value=speed,             inline=True)
-    embed.add_field(name="Bass Boost",    value=bass,              inline=True)
-    embed.add_field(name="24/7 Mode",     value=mode_247,          inline=True)
-    embed.add_field(name="Autoplay",      value=autoplay,          inline=True)
+    embed.add_field(name="Uptime",         value=uptime_str,         inline=True)
+    embed.add_field(name="Ping",           value=f"{latency_ms} ms", inline=True)
+    embed.add_field(name="Songs Played",   value=str(songs_played),  inline=True)
+    embed.add_field(name="Now Playing",    value=current,            inline=False)
+    embed.add_field(name="Queue",          value=queue_str,          inline=True)
+    embed.add_field(name="Listened",       value=listen_str,         inline=True)
+    embed.add_field(name="Volume",         value=vol,                inline=True)
+    embed.add_field(name="Loop",           value=loop,               inline=True)
+    embed.add_field(name="Filter",         value=filt,               inline=True)
+    embed.add_field(name="EQ",             value=eq,                 inline=True)
+    embed.add_field(name="Speed",          value=speed,              inline=True)
+    embed.add_field(name="Bass Boost",     value=bass,               inline=True)
+    embed.add_field(name="24/7 Mode",      value=mode_247,           inline=True)
+    embed.add_field(name="Autoplay",       value=autoplay,           inline=True)
     await interaction.response.send_message(embed=embed)
 
 
