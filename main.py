@@ -1072,7 +1072,7 @@ class SearchView(discord.ui.View):
         if self.q.voice_client and (self.q.voice_client.is_playing() or
                                      self.q.voice_client.is_paused() or self.q.current):
             self.q.tracks.append(track)
-            await interaction.followup.send(embed=_queued_embed(track, self.q))
+            await interaction.followup.send(embed=_queued_embed(track, self.q), delete_after=25)
         else:
             self.q.current = track
             await _start_playing(self.guild, self.q, send_np=False)
@@ -1382,6 +1382,17 @@ async def _play_next(guild: discord.Guild) -> None:
                     q.idle_task.cancel()
                 q.idle_task = asyncio.create_task(_idle_disconnect(guild))
             return
+
+        # Last-song warning — post once when only 1 track remains
+        if len(q.tracks) == 1 and q.text_channel:
+            try:
+                next_title = q.tracks[0].title
+                await q.text_channel.send(
+                    f"⚠️ **Last song in queue:** *{next_title}* — queue more songs to keep the music going!",
+                    delete_after=30,
+                )
+            except Exception:
+                pass
 
         q.current = q.tracks.popleft()
         await _start_playing(guild, q)
@@ -1746,7 +1757,7 @@ async def cmd_play(interaction: discord.Interaction, query: str):
 
         if q.voice_client.is_playing() or q.voice_client.is_paused() or q.current is not None:
             q.tracks.append(track)
-            await interaction.followup.send(embed=_queued_embed(track, q))
+            await interaction.followup.send(embed=_queued_embed(track, q), delete_after=25)
         else:
             q.current = track
             await _start_playing(interaction.guild, q, send_np=False)
@@ -2381,6 +2392,80 @@ async def cmd_lyrics(interaction: discord.Interaction):
     else:
         view = LyricsView(chunks, clean, thumbnail=thumbnail)
         await interaction.followup.send(embed=view._build_embed(), view=view)
+
+
+@bot.tree.command(name="previous", description="Replay the previous song")
+@music_channel_only()
+@dj_only()
+async def cmd_previous(interaction: discord.Interaction):
+    q = queues.get(interaction.guild_id)
+    if not q or not q.history:
+        return await interaction.response.send_message("📭 No previous song in history.", ephemeral=True)
+    if not q.voice_client or not q.voice_client.is_connected():
+        return await interaction.response.send_message("❌ Not connected to a voice channel.", ephemeral=True)
+    prev = q.history[-1]          # most recent history entry
+    # Put current song back at the front so it resumes after the previous
+    if q.current:
+        q.tracks.appendleft(q.current)
+    q.current         = prev
+    q.restart_current = False
+    q.seek_to         = 0
+    if q.voice_client.is_playing() or q.voice_client.is_paused():
+        q.voice_client.stop()     # triggers _play_next → restart_current path
+    else:
+        await _start_playing(interaction.guild, q)
+    await interaction.response.send_message(
+        f"⏮️ Going back to **{prev.title}**.", ephemeral=False)
+
+
+@bot.tree.command(name="songinfo", description="Show detailed info about the current song")
+@music_channel_only()
+async def cmd_songinfo(interaction: discord.Interaction):
+    q = queues.get(interaction.guild_id)
+    if not q or not q.current:
+        return await interaction.response.send_message("❌ Nothing is playing.", ephemeral=True)
+    track = q.current
+    await interaction.response.defer()
+    # Re-fetch metadata for view count, upload date, channel
+    loop = asyncio.get_event_loop()
+    info = None
+    try:
+        opts = {**YDL_OPTS, "skip_download": True, "quiet": True}
+        def _fetch():
+            with yt_dlp.YoutubeDL(opts) as ydl:
+                return ydl.extract_info(track.webpage_url, download=False)
+        info = await asyncio.wait_for(loop.run_in_executor(None, _fetch), timeout=15)
+    except Exception:
+        pass
+
+    embed = discord.Embed(
+        title       = track.title,
+        url         = track.webpage_url,
+        color       = 0x5865F2,
+    )
+    if track.thumbnail:
+        embed.set_image(url=track.thumbnail)
+
+    embed.add_field(name="Duration",     value=track.duration,      inline=True)
+    embed.add_field(name="Requested by", value=track.requested_by,  inline=True)
+
+    if info:
+        channel  = info.get("channel") or info.get("uploader", "Unknown")
+        views    = info.get("view_count")
+        likes    = info.get("like_count")
+        uploaded = info.get("upload_date")      # YYYYMMDD string
+
+        embed.add_field(name="Channel", value=channel, inline=True)
+        if views is not None:
+            embed.add_field(name="Views", value=f"{views:,}", inline=True)
+        if likes is not None:
+            embed.add_field(name="Likes", value=f"{likes:,}", inline=True)
+        if uploaded and len(uploaded) == 8:
+            date_str = f"{uploaded[0:4]}-{uploaded[4:6]}-{uploaded[6:8]}"
+            embed.add_field(name="Uploaded", value=date_str, inline=True)
+
+    embed.set_footer(text="Different Music · Song Info")
+    await interaction.followup.send(embed=embed)
 
 
 @bot.tree.command(name="history", description="Show the last 10 songs played")
