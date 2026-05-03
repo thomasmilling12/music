@@ -148,6 +148,8 @@ class GuildQueue:
     prefetch_task:      Optional[asyncio.Task]     = None
     # Accumulated playback time this session (seconds)
     session_listen_secs: int                       = 0
+    # Auto-pause state — set when bot pauses because everyone left voice
+    alone_paused:        bool                      = False
 
 
 # Global state
@@ -808,12 +810,26 @@ class NowPlayingView(discord.ui.View):
             return await interaction.response.send_message("❌ Nothing is playing.", ephemeral=True)
         if not _same_vc(interaction, q):
             return await interaction.response.send_message("❌ Join my voice channel first.", ephemeral=True)
-        if not has_dj_role(interaction.user):
-            return await interaction.response.send_message(
-                f"❌ You need the **{DJ_ROLE_NAME}** role to skip.", ephemeral=True)
-        q.vote_skip_users.clear()
-        q.voice_client.stop()
-        await interaction.response.send_message("⏭️ Skipped.", ephemeral=True)
+        # DJs skip instantly — everyone else triggers a vote
+        if has_dj_role(interaction.user):
+            q.vote_skip_users.clear()
+            q.voice_client.stop()
+            return await interaction.response.send_message("⏭️ Skipped.", ephemeral=True)
+        listeners   = [m for m in q.voice_client.channel.members if not m.bot]
+        needed      = max(1, math.ceil(len(listeners) / 2))
+        if interaction.user.id in q.vote_skip_users:
+            return await interaction.response.send_message("🗳️ You already voted to skip.", ephemeral=True)
+        q.vote_skip_users.add(interaction.user.id)
+        valid_votes = sum(1 for uid in q.vote_skip_users if any(m.id == uid for m in listeners))
+        if valid_votes >= needed:
+            q.vote_skip_users.clear()
+            q.voice_client.stop()
+            await interaction.response.send_message(f"⏭️ Vote skip passed! ({valid_votes}/{needed})")
+        else:
+            await interaction.response.send_message(
+                f"🗳️ Skip vote: **{valid_votes}/{needed}** — need {needed - valid_votes} more.",
+                delete_after=15,
+            )
 
     @discord.ui.button(emoji="🔁", style=discord.ButtonStyle.secondary, custom_id="np_loop")
     async def toggle_loop(self, interaction: discord.Interaction, button: discord.ui.Button):
@@ -1567,6 +1583,33 @@ class MusicBot(commands.Bot):
         if not vc or not vc.channel:
             return
 
+        q = queues.get(guild.id)
+
+        # ── Someone JOINED the bot's channel ──────────────────────────────────
+        joined_bots_channel = (
+            after.channel == vc.channel and
+            before.channel != vc.channel
+        )
+        if joined_bots_channel and q and q.alone_paused:
+            q.alone_paused = False
+            if q.idle_task:
+                q.idle_task.cancel()
+                q.idle_task = None
+            if vc.is_paused():
+                vc.resume()
+                if q.paused_at is not None:
+                    q.paused_at = None
+            if q.text_channel:
+                try:
+                    await q.text_channel.send(
+                        f"▶️ {member.display_name} joined — resuming!",
+                        delete_after=10,
+                    )
+                except Exception:
+                    pass
+            return
+
+        # ── Someone LEFT the bot's channel ────────────────────────────────────
         left_bots_channel = (
             before.channel == vc.channel and
             after.channel  != before.channel
@@ -1576,27 +1619,34 @@ class MusicBot(commands.Bot):
 
         humans = [m for m in vc.channel.members if not m.bot]
         if humans:
-            return
+            return                      # Others still present
 
-        q = queues.get(guild.id)
         if q and q.mode_247:
-            return
+            return                      # 24/7 mode — stay and keep playing
 
-        if vc.is_playing() or vc.is_paused():
-            vc.stop()
-        await vc.disconnect()
+        # Pause instead of disconnect; start idle timer as a fallback
+        if vc.is_playing():
+            vc.pause()
+            if q:
+                q.paused_at    = time.monotonic()
+                q.alone_paused = True
+        elif vc.is_paused() and q:
+            q.alone_paused = True
+
         if q:
-            _cancel_np_tasks(q)
             if q.idle_task:
                 q.idle_task.cancel()
-            q.current = None
+            q.idle_task = asyncio.create_task(_idle_disconnect(guild))
+
+        print(f"[Auto-pause] Everyone left #{before.channel.name} — paused")
         text_ch = q.text_channel if q else None
-        _cleanup_guild(guild.id)
-        asyncio.create_task(_update_presence(None))
-        print(f"[Auto-leave] Everyone left #{before.channel.name}")
         if text_ch:
             try:
-                await text_ch.send("👋 Everyone left — disconnected.")
+                await text_ch.send(
+                    "👤 Everyone left — paused. I'll resume when someone joins, "
+                    "or disconnect in 5 minutes.",
+                    delete_after=60,
+                )
             except Exception:
                 pass
 
@@ -2107,6 +2157,18 @@ async def cmd_clear(interaction: discord.Interaction):
     await interaction.response.send_message(f"🗑️ Cleared **{count}** song(s).")
 
 
+@bot.tree.command(name="clearqueue", description="Clear all upcoming songs without stopping the current one")
+@music_channel_only()
+@dj_only()
+async def cmd_clearqueue(interaction: discord.Interaction):
+    q = queues.get(interaction.guild_id)
+    if not q or not q.tracks:
+        return await interaction.response.send_message("❌ The queue is already empty.", ephemeral=True)
+    count = len(q.tracks)
+    q.tracks.clear()
+    await interaction.response.send_message(f"🗑️ Cleared **{count}** song(s).")
+
+
 @bot.tree.command(name="remove", description="Remove a song from the queue by position")
 @app_commands.describe(position="Position number (see /queue)")
 @music_channel_only()
@@ -2139,6 +2201,22 @@ async def cmd_move(interaction: discord.Interaction, from_pos: int, to_pos: int)
     lst.insert(to_pos - 1, t)
     q.tracks = deque(lst)
     await interaction.response.send_message(f"↕️ Moved **{t.title}** to position **{to_pos}**.")
+
+
+@bot.tree.command(name="summon", description="Move the bot to your current voice channel")
+@music_channel_only()
+@dj_only()
+async def cmd_summon(interaction: discord.Interaction):
+    if not interaction.user.voice or not interaction.user.voice.channel:
+        return await interaction.response.send_message("❌ Join a voice channel first.", ephemeral=True)
+    target = interaction.user.voice.channel
+    q      = queues.get(interaction.guild_id)
+    if not q or not q.voice_client:
+        return await interaction.response.send_message("❌ I'm not connected to voice.", ephemeral=True)
+    if q.voice_client.channel == target:
+        return await interaction.response.send_message("✅ Already in your channel!", ephemeral=True)
+    await q.voice_client.move_to(target)
+    await interaction.response.send_message(f"✅ Moved to **{target.name}**.")
 
 
 # ---------------------------------------------------------------------------
@@ -2290,6 +2368,75 @@ async def cmd_bass(interaction: discord.Interaction):
         asyncio.create_task(_refresh_np_embed(q))
     state = "🔊 **Bass boost ON**" if q.bass_boost else "🔈 **Bass boost OFF**"
     await interaction.response.send_message(state)
+
+
+def _apply_filter_restart(q: GuildQueue) -> None:
+    """Restart current playback from the current position so a new filter takes effect."""
+    if q.voice_client and q.current and (q.voice_client.is_playing() or q.voice_client.is_paused()):
+        elapsed           = int(time.monotonic() - q.play_start) if q.play_start else 0
+        q.restart_current = True
+        q.seek_to         = elapsed
+        q.voice_client.stop()
+    else:
+        asyncio.create_task(_refresh_np_embed(q))
+
+
+@bot.tree.command(name="nightcore", description="Toggle Nightcore mode (faster + higher pitch)")
+@music_channel_only()
+@dj_only()
+async def cmd_nightcore(interaction: discord.Interaction):
+    q = queues.get(interaction.guild_id)
+    if not q:
+        return await interaction.response.send_message("❌ Not connected.", ephemeral=True)
+    if not _same_vc(interaction, q):
+        return await interaction.response.send_message("❌ Join my voice channel first.", ephemeral=True)
+    if q.audio_filter == "nightcore":
+        q.audio_filter = None
+        _apply_filter_restart(q)
+        await interaction.response.send_message("🌙 Nightcore **off**.")
+    else:
+        q.audio_filter = "nightcore"
+        q.speed        = 1.0        # filters handle tempo internally
+        _apply_filter_restart(q)
+        await interaction.response.send_message("🌙 Nightcore **on** — faster + higher pitch.")
+
+
+@bot.tree.command(name="slowed", description="Toggle Slowed+Reverb mode (lo-fi / slowed to perfection)")
+@music_channel_only()
+@dj_only()
+async def cmd_slowed(interaction: discord.Interaction):
+    q = queues.get(interaction.guild_id)
+    if not q:
+        return await interaction.response.send_message("❌ Not connected.", ephemeral=True)
+    if not _same_vc(interaction, q):
+        return await interaction.response.send_message("❌ Join my voice channel first.", ephemeral=True)
+    if q.audio_filter == "slowed":
+        q.audio_filter = None
+        _apply_filter_restart(q)
+        await interaction.response.send_message("🐢 Slowed **off**.")
+    else:
+        q.audio_filter = "slowed"
+        q.speed        = 1.0
+        _apply_filter_restart(q)
+        await interaction.response.send_message("🐢 Slowed **on** — slightly slower + lower pitch.")
+
+
+@bot.tree.command(name="normal", description="Reset ALL effects — filters, EQ, speed, and bass boost")
+@music_channel_only()
+@dj_only()
+async def cmd_normal(interaction: discord.Interaction):
+    q = queues.get(interaction.guild_id)
+    if not q:
+        return await interaction.response.send_message("❌ Not connected.", ephemeral=True)
+    if not _same_vc(interaction, q):
+        return await interaction.response.send_message("❌ Join my voice channel first.", ephemeral=True)
+    q.audio_filter = None
+    q.eq_preset    = "flat"
+    q.speed        = 1.0
+    q.bass_boost   = False
+    _apply_filter_restart(q)
+    await interaction.response.send_message("✅ All effects reset to normal.")
+
 
 
 @bot.tree.command(name="autoplay", description="Toggle autoplay — keeps music going when the queue empties")
@@ -2466,6 +2613,106 @@ async def cmd_songinfo(interaction: discord.Interaction):
 
     embed.set_footer(text="Different Music · Song Info")
     await interaction.followup.send(embed=embed)
+
+
+# ---------------------------------------------------------------------------
+# Poll view — 30-second vote between two song choices
+# ---------------------------------------------------------------------------
+
+class PollView(discord.ui.View):
+    def __init__(self, option_a: str, option_b: str):
+        super().__init__(timeout=30)
+        self.option_a  = option_a
+        self.option_b  = option_b
+        self.votes_a:  set[int] = set()
+        self.votes_b:  set[int] = set()
+        self.winner:   Optional[str] = None
+        self.msg:      Optional[discord.Message] = None
+
+    def _counts(self):
+        return len(self.votes_a), len(self.votes_b)
+
+    def _build_embed(self, ended: bool = False) -> discord.Embed:
+        a, b  = self._counts()
+        total = a + b or 1
+        bar_a = "█" * round(10 * a / total) + "░" * (10 - round(10 * a / total))
+        bar_b = "█" * round(10 * b / total) + "░" * (10 - round(10 * b / total))
+        color = 0x57F287 if ended else 0x5865F2
+        title = "🗳️ Song Poll — Ended!" if ended else "🗳️ Song Poll — 30 seconds to vote!"
+        embed = discord.Embed(title=title, color=color)
+        embed.add_field(
+            name=f"🅰️  {self.option_a}",
+            value=f"`{bar_a}` {a} vote{'s' if a != 1 else ''}",
+            inline=False,
+        )
+        embed.add_field(
+            name=f"🅱️  {self.option_b}",
+            value=f"`{bar_b}` {b} vote{'s' if b != 1 else ''}",
+            inline=False,
+        )
+        if ended:
+            if a == b:
+                embed.set_footer(text="It's a tie! Playing option A by default.")
+            else:
+                winner_label = self.option_a if a > b else self.option_b
+                embed.set_footer(text=f"Winner: {winner_label} — queueing now!")
+        else:
+            embed.set_footer(text="Press a button to vote. You can change your vote.")
+        return embed
+
+    @discord.ui.button(label="Vote A", emoji="🅰️", style=discord.ButtonStyle.primary,  custom_id="poll_a")
+    async def vote_a(self, interaction: discord.Interaction, button: discord.ui.Button):
+        self.votes_b.discard(interaction.user.id)
+        self.votes_a.add(interaction.user.id)
+        await interaction.response.edit_message(embed=self._build_embed())
+
+    @discord.ui.button(label="Vote B", emoji="🅱️", style=discord.ButtonStyle.secondary, custom_id="poll_b")
+    async def vote_b(self, interaction: discord.Interaction, button: discord.ui.Button):
+        self.votes_a.discard(interaction.user.id)
+        self.votes_b.add(interaction.user.id)
+        await interaction.response.edit_message(embed=self._build_embed())
+
+    async def on_timeout(self):
+        a, b = self._counts()
+        self.winner = self.option_a if a >= b else self.option_b
+        for item in self.children:
+            item.disabled = True
+        if self.msg:
+            try:
+                await self.msg.edit(embed=self._build_embed(ended=True), view=self)
+            except Exception:
+                pass
+
+
+@bot.tree.command(name="poll", description="Start a 30-second vote for which song plays next")
+@app_commands.describe(
+    option_a="First song option (name or URL)",
+    option_b="Second song option (name or URL)",
+)
+@music_channel_only()
+@dj_only()
+async def cmd_poll(interaction: discord.Interaction, option_a: str, option_b: str):
+    q = queues.get(interaction.guild_id)
+    if not q or not q.voice_client:
+        return await interaction.response.send_message("❌ Not connected.", ephemeral=True)
+    view  = PollView(option_a, option_b)
+    embed = view._build_embed()
+    await interaction.response.send_message(embed=embed, view=view)
+    view.msg = await interaction.original_response()
+    # Wait for poll to time out, then queue the winner
+    await asyncio.sleep(32)     # slight buffer after the 30-second view timeout
+    if view.winner:
+        winning_query = view.winner
+        track = await fetch_track(winning_query, str(interaction.user), interaction.user.id)
+        if track and not isinstance(track, str):
+            track.requester_avatar = str(interaction.user.display_avatar.url)
+            q.tracks.appendleft(track)
+            try:
+                await interaction.followup.send(
+                    f"🗳️ Poll winner queued at the top: **{track.title}**"
+                )
+            except Exception:
+                pass
 
 
 @bot.tree.command(name="history", description="Show the last 10 songs played")
