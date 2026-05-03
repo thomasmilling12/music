@@ -569,6 +569,15 @@ def _np_embed(track: Track, q: GuildQueue,
     effects = _effect_summary(q)
     embed.add_field(name="Effects", value=effects, inline=False)
 
+    # "Up Next" preview
+    if q.tracks:
+        next_track = q.tracks[0]
+        embed.add_field(
+            name="Up Next",
+            value=f"[{next_track.title}]({next_track.webpage_url}) `{next_track.duration}`",
+            inline=False,
+        )
+
     if track.thumbnail:
         embed.set_thumbnail(url=track.thumbnail)
     footer_text = f"Requested by {track.requested_by}"
@@ -875,7 +884,32 @@ class NowPlayingView(discord.ui.View):
             q.voice_client.stop()
         await interaction.response.send_message(f"⏩ Forward 30s → `{fmt_dur(new_pos)}`", ephemeral=True)
 
-    @discord.ui.button(emoji="🔉", style=discord.ButtonStyle.secondary, custom_id="np_vol_down", row=2)
+    @discord.ui.button(emoji="❤️", style=discord.ButtonStyle.secondary, custom_id="np_favorite", row=2)
+    async def favorite(self, interaction: discord.Interaction, button: discord.ui.Button):
+        q = self._q()
+        if not q or not q.current:
+            return await interaction.response.send_message("❌ Nothing is playing.", ephemeral=True)
+        track = q.current
+        try:
+            embed = discord.Embed(
+                title       = "❤️ Saved to your DMs",
+                description = f"**[{track.title}]({track.webpage_url})**",
+                color       = 0xED4245,
+            )
+            embed.add_field(name="Duration",     value=track.duration,      inline=True)
+            embed.add_field(name="Requested by", value=track.requested_by,  inline=True)
+            if track.thumbnail:
+                embed.set_thumbnail(url=track.thumbnail)
+            embed.set_footer(text="Saved from Different Music")
+            await interaction.user.send(embed=embed)
+            await interaction.response.send_message("❤️ Sent to your DMs!", ephemeral=True)
+        except discord.Forbidden:
+            await interaction.response.send_message(
+                "❌ I can't DM you — enable DMs from server members in your privacy settings.",
+                ephemeral=True,
+            )
+
+    @discord.ui.button(emoji="🔉", style=discord.ButtonStyle.secondary, custom_id="np_vol_down", row=3)
     async def vol_down(self, interaction: discord.Interaction, button: discord.ui.Button):
         q = self._q()
         if not q:
@@ -896,7 +930,7 @@ class NowPlayingView(discord.ui.View):
             q.voice_client.stop()
         await interaction.response.send_message(f"🔉 Volume → **{int(new_vol * 100)}%**", ephemeral=True)
 
-    @discord.ui.button(emoji="🔊", style=discord.ButtonStyle.secondary, custom_id="np_vol_up", row=1)
+    @discord.ui.button(emoji="🔊", style=discord.ButtonStyle.secondary, custom_id="np_vol_up", row=3)
     async def vol_up(self, interaction: discord.Interaction, button: discord.ui.Button):
         q = self._q()
         if not q:
@@ -1218,18 +1252,38 @@ async def _start_playing(guild: discord.Guild, q: GuildQueue,
     if q.tracks:
         q.prefetch_task = asyncio.create_task(_prefetch_next(q))
 
+    # Warn if the stream URL had to be re-fetched (expired)
+    if q.text_channel and seek_secs == 0:
+        if not (time.monotonic() - q.current.fetched_at > STREAM_TTL):
+            pass  # fresh URL, no warning needed
+        else:
+            try:
+                await q.text_channel.send(
+                    "🔄 Refreshed an expired stream URL — brief pause was expected.",
+                    delete_after=12,
+                )
+            except Exception:
+                pass
+
     _cancel_np_tasks(q)
 
     if send_np and q.announce and q.text_channel and seek_secs == 0:
         try:
-            view = NowPlayingView(guild.id)
-            msg  = await q.text_channel.send(
-                embed=_np_embed(q.current, q, q.play_start),
-                view=view,
-            )
-            _register_np(q, msg, q.current, guild.id)
+            view  = NowPlayingView(guild.id)
+            embed = _np_embed(q.current, q, q.play_start)
+            existing = q.np_message          # reuse if still alive
+            if existing:
+                try:
+                    await existing.edit(embed=embed, view=view)
+                    _register_np(q, existing, q.current, guild.id)
+                except discord.NotFound:     # message was deleted — send a fresh one
+                    msg = await q.text_channel.send(embed=embed, view=view)
+                    _register_np(q, msg, q.current, guild.id)
+            else:
+                msg = await q.text_channel.send(embed=embed, view=view)
+                _register_np(q, msg, q.current, guild.id)
         except Exception as e:
-            print(f"[Player] Could not send Now Playing card: {e}")
+            print(f"[Player] Could not send/edit Now Playing card: {e}")
 
 
 async def _prefetch_next(q: GuildQueue) -> None:
@@ -1892,7 +1946,9 @@ async def cmd_skip(interaction: discord.Interaction):
         await interaction.response.send_message(f"⏭️ Vote skip passed! ({valid_votes}/{needed})")
     else:
         await interaction.response.send_message(
-            f"🗳️ Skip vote: **{valid_votes}/{needed}** — need {needed - valid_votes} more.")
+            f"🗳️ Skip vote: **{valid_votes}/{needed}** — need {needed - valid_votes} more.",
+            delete_after=15,
+        )
 
 
 @bot.tree.command(name="skipto", description="Skip to a specific position in the queue")
@@ -2177,16 +2233,21 @@ async def cmd_speed(interaction: discord.Interaction, value: float):
 # Slash commands — DJ settings
 # ---------------------------------------------------------------------------
 
-@bot.tree.command(name="volume", description="Set the volume (1–100) — applies immediately")
-@app_commands.describe(level="Volume level between 1 and 100")
+@bot.tree.command(name="volume", description="Set or check the volume (1–100)")
+@app_commands.describe(level="Volume level 1–100. Omit to see current volume.")
 @music_channel_only()
 @dj_only()
-async def cmd_volume(interaction: discord.Interaction, level: int):
-    if not 1 <= level <= 100:
-        return await interaction.response.send_message("❌ Volume must be between 1 and 100.", ephemeral=True)
+async def cmd_volume(interaction: discord.Interaction, level: Optional[int] = None):
     q = queues.get(interaction.guild_id)
     if not q:
         return await interaction.response.send_message("❌ Not connected.", ephemeral=True)
+    if level is None:
+        current_pct = round(q.volume * 100)
+        bar = "█" * (current_pct // 10) + "░" * (10 - current_pct // 10)
+        return await interaction.response.send_message(
+            f"🔊 Current volume: **{current_pct}%**\n`{bar}`", ephemeral=True)
+    if not 1 <= level <= 100:
+        return await interaction.response.send_message("❌ Volume must be between 1 and 100.", ephemeral=True)
     old      = q.volume
     q.volume = level / 100
     if (q.voice_client and q.current
@@ -2482,6 +2543,33 @@ async def cmd_np(interaction: discord.Interaction):
         return await interaction.response.send_message("❌ Nothing is playing.", ephemeral=True)
     view = NowPlayingView(interaction.guild_id)
     await interaction.response.send_message(embed=_np_embed(q.current, q, q.play_start), view=view)
+
+
+@bot.tree.command(name="grab", description="DM yourself the current song details")
+@music_channel_only()
+async def cmd_grab(interaction: discord.Interaction):
+    q = queues.get(interaction.guild_id)
+    if not q or not q.current:
+        return await interaction.response.send_message("❌ Nothing is playing.", ephemeral=True)
+    track = q.current
+    try:
+        embed = discord.Embed(
+            title       = "❤️ Grabbed Song",
+            description = f"**[{track.title}]({track.webpage_url})**",
+            color       = 0xED4245,
+        )
+        embed.add_field(name="Duration",     value=track.duration,     inline=True)
+        embed.add_field(name="Requested by", value=track.requested_by, inline=True)
+        if track.thumbnail:
+            embed.set_thumbnail(url=track.thumbnail)
+        embed.set_footer(text="Saved from Different Music")
+        await interaction.user.send(embed=embed)
+        await interaction.response.send_message("❤️ Sent to your DMs!", ephemeral=True)
+    except discord.Forbidden:
+        await interaction.response.send_message(
+            "❌ I can't DM you — enable DMs from server members in your privacy settings.",
+            ephemeral=True,
+        )
 
 
 @bot.tree.command(name="disconnect", description="Stop playback and disconnect (alias for /stop)")
