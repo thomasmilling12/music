@@ -574,9 +574,10 @@ def _np_embed(track: Track, q: GuildQueue,
     # "Up Next" preview
     if q.tracks:
         next_track = q.tracks[0]
+        next_url   = next_track.webpage_url or "https://youtube.com"
         embed.add_field(
             name="Up Next",
-            value=f"[{next_track.title}]({next_track.webpage_url}) `{next_track.duration}`",
+            value=f"[{next_track.title}]({next_url}) `{next_track.duration}`",
             inline=False,
         )
 
@@ -1218,6 +1219,12 @@ async def _start_playing(guild: discord.Guild, q: GuildQueue,
         q.current = None
         return
 
+    # Capture BEFORE resolving so we can warn the channel after a successful re-fetch
+    stream_was_expired = (
+        bool(q.current.stream_url) and
+        (time.monotonic() - q.current.fetched_at > STREAM_TTL)
+    )
+
     if not await _resolve_stream(q.current):
         failed_title = q.current.title
         print(f"[Player] Could not resolve stream for '{failed_title}' — skipping")
@@ -1268,31 +1275,30 @@ async def _start_playing(guild: discord.Guild, q: GuildQueue,
     if q.tracks:
         q.prefetch_task = asyncio.create_task(_prefetch_next(q))
 
-    # Warn if the stream URL had to be re-fetched (expired)
-    if q.text_channel and seek_secs == 0:
-        if not (time.monotonic() - q.current.fetched_at > STREAM_TTL):
-            pass  # fresh URL, no warning needed
-        else:
-            try:
-                await q.text_channel.send(
-                    "🔄 Refreshed an expired stream URL — brief pause was expected.",
-                    delete_after=12,
-                )
-            except Exception:
-                pass
+    # Warn the channel if an expired stream URL was successfully re-fetched
+    if stream_was_expired and q.text_channel and seek_secs == 0:
+        try:
+            await q.text_channel.send(
+                "🔄 Refreshed an expired stream URL — brief pause was expected.",
+                delete_after=12,
+            )
+        except Exception:
+            pass
 
+    # Save existing NP message reference BEFORE _cancel_np_tasks clears it
+    existing_np = q.np_message
     _cancel_np_tasks(q)
 
     if send_np and q.announce and q.text_channel and seek_secs == 0:
         try:
             view  = NowPlayingView(guild.id)
             embed = _np_embed(q.current, q, q.play_start)
-            existing = q.np_message          # reuse if still alive
-            if existing:
+            if existing_np:
                 try:
-                    await existing.edit(embed=embed, view=view)
-                    _register_np(q, existing, q.current, guild.id)
-                except discord.NotFound:     # message was deleted — send a fresh one
+                    await existing_np.edit(embed=embed, view=view)
+                    _register_np(q, existing_np, q.current, guild.id)
+                except (discord.NotFound, discord.HTTPException):
+                    # Message deleted or stale — send a fresh one
                     msg = await q.text_channel.send(embed=embed, view=view)
                     _register_np(q, msg, q.current, guild.id)
             else:
@@ -1727,6 +1733,20 @@ async def ensure_voice(interaction: discord.Interaction) -> Optional[GuildQueue]
         q.voice_client = existing_vc
 
     q.text_channel = interaction.channel
+
+    # If the bot was auto-paused (everyone left) and the user is now in the same
+    # channel, treat this as a "rejoin" and resume without waiting for a voice-state event
+    if (q.alone_paused
+            and q.voice_client
+            and q.voice_client.channel == channel):
+        q.alone_paused = False
+        if q.idle_task:
+            q.idle_task.cancel()
+            q.idle_task = None
+        if q.voice_client.is_paused():
+            q.voice_client.resume()
+            q.paused_at = None
+
     return q
 
 
