@@ -303,10 +303,16 @@ def _info_to_track(info: dict, requested_by: str, requested_by_id: int = 0) -> T
             if fmt.get("acodec") != "none" and fmt.get("url"):
                 stream_url = fmt["url"]
                 break
-    dur = info.get("duration")
+    dur        = info.get("duration")
+    vid_id     = info.get("id", "")
+    # Always ensure a valid URL — some yt-dlp search results omit webpage_url
+    webpage_url = (
+        info.get("webpage_url")
+        or (f"https://youtu.be/{vid_id}" if vid_id else "https://www.youtube.com")
+    )
     return Track(
         title           = info.get("title", "Unknown"),
-        webpage_url     = info.get("webpage_url", ""),
+        webpage_url     = webpage_url,
         stream_url      = stream_url,
         duration        = fmt_dur(dur),
         duration_secs   = int(dur) if dur else None,
@@ -550,9 +556,10 @@ def _np_embed(track: Track, q: GuildQueue,
               play_start: Optional[float] = None) -> discord.Embed:
     queue_len  = len(q.tracks)
     queue_note = f"{queue_len} more in queue" if queue_len else "Last song"
+    safe_url = track.webpage_url or "https://www.youtube.com"
     embed = discord.Embed(
         title       = f"🎵 Now Playing  ·  {queue_note}",
-        description = f"**[{track.title}]({track.webpage_url})**",
+        description = f"**[{track.title}]({safe_url})**",
         color       = 0x5865F2,
     )
     if play_start and track.duration_secs:
@@ -593,11 +600,12 @@ def _np_embed(track: Track, q: GuildQueue,
 
 def _queued_embed(track: Track, q: GuildQueue) -> discord.Embed:
     """Embed shown when a track is added to an already-playing queue."""
-    pos  = len(q.tracks)
-    wait = est_wait(q)
+    pos      = len(q.tracks)
+    wait     = est_wait(q)
+    safe_url = track.webpage_url or "https://www.youtube.com"
     embed = discord.Embed(
         title       = "➕ Added to Queue",
-        description = f"**[{track.title}]({track.webpage_url})**",
+        description = f"**[{track.title}]({safe_url})**",
         color       = 0x5865F2,
     )
     embed.add_field(name="Duration",     value=track.duration,    inline=True)
@@ -1265,7 +1273,23 @@ async def _start_playing(guild: discord.Guild, q: GuildQueue,
                 return
         asyncio.run_coroutine_threadsafe(_play_next(guild), guild._state.loop)
 
-    q.voice_client.play(source, after=after_play)
+    try:
+        q.voice_client.play(source, after=after_play)
+    except discord.ClientException as e:
+        # e.g. "Already playing audio" — stop current and retry once
+        print(f"[Player] ClientException on play(): {e} — stopping and retrying")
+        try:
+            q.voice_client.stop()
+            await asyncio.sleep(0.5)
+            q.voice_client.play(source, after=after_play)
+        except Exception as retry_err:
+            print(f"[Player] Retry also failed: {retry_err}")
+            q.current = None
+            return
+    except Exception as e:
+        print(f"[Player] Unexpected error starting playback: {e}")
+        q.current = None
+        return
     print(f"[Player] ▶ {q.current.title}")
     asyncio.create_task(_update_presence(q.current, is_playing=True))
 
@@ -1839,10 +1863,13 @@ async def cmd_play(interaction: discord.Interaction, query: str):
             _register_np(q, msg, track, interaction.guild_id)
 
     except Exception as e:
-        print(f"[cmd_play] Unhandled error: {e}")
+        print(f"[cmd_play] Unhandled error: {type(e).__name__}: {e}")
         traceback.print_exc()
         try:
-            await interaction.followup.send("❌ Something went wrong. Please try again.", ephemeral=True)
+            await interaction.followup.send(
+                f"❌ Something went wrong (`{type(e).__name__}: {e}`). Please try again.",
+                ephemeral=True,
+            )
         except Exception:
             pass
 
