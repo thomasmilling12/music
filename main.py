@@ -199,6 +199,15 @@ def progress_bar(elapsed: int, total: int, width: int = 17) -> str:
     return f"`{fmt_dur(elapsed)}` {bar} `{fmt_dur(total)}`"
 
 
+async def _auto_delete(msg, delay: float) -> None:
+    """Delete a message after `delay` seconds (silent on failure)."""
+    await asyncio.sleep(delay)
+    try:
+        await msg.delete()
+    except Exception:
+        pass
+
+
 def parse_time(s: str) -> Optional[int]:
     """Parse '1:30', '1:02:30', or '90' into total seconds."""
     try:
@@ -1097,7 +1106,8 @@ class SearchView(discord.ui.View):
         if self.q.voice_client and (self.q.voice_client.is_playing() or
                                      self.q.voice_client.is_paused() or self.q.current):
             self.q.tracks.append(track)
-            await interaction.followup.send(embed=_queued_embed(track, self.q), delete_after=25)
+            _msg = await interaction.followup.send(embed=_queued_embed(track, self.q))
+            asyncio.create_task(_auto_delete(_msg, 25))
         else:
             self.q.current = track
             await _start_playing(self.guild, self.q, send_np=False)
@@ -1851,7 +1861,8 @@ async def cmd_play(interaction: discord.Interaction, query: str):
 
         if q.voice_client.is_playing() or q.voice_client.is_paused() or q.current is not None:
             q.tracks.append(track)
-            await interaction.followup.send(embed=_queued_embed(track, q), delete_after=25)
+            _msg = await interaction.followup.send(embed=_queued_embed(track, q))
+            asyncio.create_task(_auto_delete(_msg, 25))
         else:
             q.current = track
             await _start_playing(interaction.guild, q, send_np=False)
