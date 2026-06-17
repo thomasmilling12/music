@@ -40,6 +40,9 @@ BOT_START        = time.monotonic()
 TWITCH_URL       = os.getenv("TWITCH_URL", "https://twitch.tv/discord")
 # Where to store saved playlists on disk
 PLAYLIST_DIR     = Path(os.getenv("PLAYLIST_DIR", os.path.expanduser("~/discord-bot/playlists")))
+# Set SONG_REQUEST_CHANNEL_ID in .env to a channel ID to enable the request channel.
+# Leave at 0 (default) to keep it disabled.
+REQUEST_CHANNEL_ID = int(os.getenv("SONG_REQUEST_CHANNEL_ID", "0"))
 
 if not TOKEN:
     raise ValueError("DISCORD_TOKEN is not set in environment")
@@ -268,6 +271,125 @@ def _same_vc(interaction: discord.Interaction, q: GuildQueue) -> bool:
 
 def _is_spotify(url: str) -> bool:
     return "open.spotify.com" in url
+
+
+_SPOTIFY_PLAYLIST_RE = re.compile(
+    r"open\.spotify\.com/(playlist|album)/([A-Za-z0-9]+)"
+)
+
+
+def _is_spotify_playlist(url: str) -> bool:
+    return bool(_SPOTIFY_PLAYLIST_RE.search(url))
+
+
+async def fetch_spotify_playlist(url: str, requested_by: str,
+                                  requested_by_id: int = 0,
+                                  limit: int = 25) -> list:
+    """Scrape track names from a Spotify playlist/album page and search YouTube for each."""
+    loop = asyncio.get_event_loop()
+
+    def _scrape() -> list[str]:
+        headers = {
+            "User-Agent": (
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/124.0.0.0 Safari/537.36"
+            ),
+            "Accept-Language": "en-US,en;q=0.9",
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        }
+        req = urllib.request.Request(url, headers=headers)
+        try:
+            with urllib.request.urlopen(req, timeout=12) as r:
+                html = r.read().decode("utf-8", errors="ignore")
+        except Exception as e:
+            print(f"[Spotify Playlist] HTTP error: {e}")
+            return []
+
+        # --- Strategy 1: parse __NEXT_DATA__ JSON embedded in the page ---
+        m = re.search(
+            r'<script id="__NEXT_DATA__" type="application/json">(.+?)</script>',
+            html, re.DOTALL,
+        )
+        if m:
+            try:
+                data = json.loads(m.group(1))
+
+                def _dig(obj, depth: int = 0) -> list[str]:
+                    """Recursively find a list of "Artist - Track" strings."""
+                    if depth > 12:
+                        return []
+                    if isinstance(obj, dict):
+                        # The items list is the payload we want
+                        if isinstance(obj.get("items"), list):
+                            results = []
+                            for item in obj["items"]:
+                                if not isinstance(item, dict):
+                                    continue
+                                track = item.get("track") or item
+                                if not isinstance(track, dict):
+                                    continue
+                                name = track.get("name")
+                                if not name:
+                                    continue
+                                artists = track.get("artists", [])
+                                if artists and isinstance(artists, list):
+                                    artist = artists[0].get("name", "")
+                                    name   = f"{artist} - {name}" if artist else name
+                                results.append(name)
+                            if results:
+                                return results
+                        for v in obj.values():
+                            r = _dig(v, depth + 1)
+                            if r:
+                                return r
+                    elif isinstance(obj, list):
+                        for item in obj:
+                            r = _dig(item, depth + 1)
+                            if r:
+                                return r
+                    return []
+
+                titles = _dig(data)
+                if titles:
+                    return list(dict.fromkeys(titles))[:limit]
+            except Exception as e:
+                print(f"[Spotify Playlist] JSON parse error: {e}")
+
+        # --- Strategy 2: regex fallback ---
+        titles = []
+        # "track":{"name":"Song","artists":[{"name":"Artist",...
+        for m2 in re.finditer(
+            r'"name"\s*:\s*"([^"]+)".*?"artists"\s*:\s*\[\s*\{"name"\s*:\s*"([^"]+)"',
+            html, re.DOTALL,
+        ):
+            titles.append(f"{m2.group(2)} - {m2.group(1)}")
+        if titles:
+            return list(dict.fromkeys(titles))[:limit]
+
+        print("[Spotify Playlist] No tracks found — page may require JS rendering")
+        return []
+
+    try:
+        titles = await asyncio.wait_for(
+            loop.run_in_executor(None, _scrape), timeout=15
+        )
+    except Exception as e:
+        print(f"[Spotify Playlist] Scrape failed: {e}")
+        return []
+
+    if not titles:
+        return []
+
+    print(f"[Spotify Playlist] Found {len(titles)} tracks, searching YouTube…")
+    tracks = []
+    for title in titles[:limit]:
+        track = await fetch_track(title, requested_by, requested_by_id)
+        if track and not isinstance(track, str):
+            tracks.append(track)
+        await asyncio.sleep(0.3)   # gentle pacing to avoid yt-dlp throttle
+
+    return tracks
 
 
 async def _spotify_title(url: str) -> Optional[str]:
@@ -1582,9 +1704,11 @@ async def _idle_disconnect(guild: discord.Guild) -> None:
 
 class MusicBot(commands.Bot):
     def __init__(self):
-        intents              = discord.Intents.default()
-        intents.voice_states = True
-        intents.guilds       = True
+        intents                 = discord.Intents.default()
+        intents.voice_states    = True
+        intents.guilds          = True
+        intents.messages        = True   # needed for song-request channel
+        intents.message_content = True   # needed to read message text
         super().__init__(command_prefix="!", intents=intents)
 
     async def setup_hook(self):
@@ -1689,6 +1813,103 @@ class MusicBot(commands.Bot):
                 )
             except Exception:
                 pass
+
+
+    async def on_message(self, message: discord.Message):
+        """Song-request channel: users type a song name and it auto-queues."""
+        await self.process_commands(message)
+
+        if message.author.bot:
+            return
+        if REQUEST_CHANNEL_ID == 0 or message.channel.id != REQUEST_CHANNEL_ID:
+            return
+
+        query = message.content.strip()
+        if not query or query.startswith(("/", "!")):
+            return
+
+        guild  = message.guild
+        member = message.author
+        if not guild or not isinstance(member, discord.Member):
+            return
+
+        # User must be in a voice channel
+        if not member.voice or not member.voice.channel:
+            try:
+                err = await message.reply("❌ Join a voice channel first!", delete_after=8)
+            except Exception:
+                pass
+            return
+
+        q       = get_queue(guild.id)
+        channel = member.voice.channel
+
+        # Connect to voice if needed
+        existing_vc = guild.voice_client
+        if not existing_vc or not existing_vc.is_connected():
+            try:
+                vc = await asyncio.wait_for(channel.connect(reconnect=True), timeout=20)
+                q.voice_client = vc
+                q.text_channel = message.channel
+            except Exception as e:
+                print(f"[Request Channel] Voice connect failed: {e}")
+                try:
+                    await message.reply("❌ Couldn't connect to your voice channel.", delete_after=8)
+                except Exception:
+                    pass
+                return
+        else:
+            q.voice_client = existing_vc
+            q.text_channel = message.channel
+
+        # Acknowledge with a loading indicator
+        try:
+            await message.add_reaction("⏳")
+        except Exception:
+            pass
+
+        track = await fetch_track(query, str(member), member.id)
+
+        try:
+            await message.remove_reaction("⏳", self.user)
+        except Exception:
+            pass
+
+        if not track or isinstance(track, str):
+            try:
+                await message.add_reaction("❌")
+                await message.reply(f"❌ Couldn't find: **{query[:80]}**", delete_after=10)
+            except Exception:
+                pass
+            return
+
+        track.requester_avatar = str(member.display_avatar.url)
+
+        if q.voice_client.is_playing() or q.voice_client.is_paused() or q.current:
+            q.tracks.append(track)
+            pos = len(q.tracks)
+            try:
+                await message.add_reaction("✅")
+                await message.reply(
+                    f"✅ **{track.title}** added at position **#{pos}**",
+                    delete_after=20,
+                )
+            except Exception:
+                pass
+        else:
+            q.current = track
+            await _start_playing(guild, q)
+            try:
+                await message.add_reaction("✅")
+            except Exception:
+                pass
+
+        # Clean up the request message after a short grace period
+        await asyncio.sleep(30)
+        try:
+            await message.delete()
+        except Exception:
+            pass
 
 
 bot = MusicBot()
@@ -1837,11 +2058,25 @@ async def cmd_play(interaction: discord.Interaction, query: str):
                 ephemeral=True,
             )
 
-        is_playlist = ("list=" in query) and query.startswith(("http://", "https://"))
+        is_yt_playlist = ("list=" in query) and query.startswith(("http://", "https://"))
+        is_sp_playlist = _is_spotify_playlist(query)
+        is_playlist    = is_yt_playlist or is_sp_playlist
+
         if is_playlist:
-            tracks = await fetch_playlist(query, str(interaction.user), uid)
+            await interaction.followup.send(
+                "⏳ Loading playlist… this may take a moment.", ephemeral=True
+            )
+            if is_sp_playlist:
+                tracks = await fetch_spotify_playlist(query, str(interaction.user), uid)
+                source_label = "Spotify playlist"
+            else:
+                tracks = await fetch_playlist(query, str(interaction.user), uid)
+                source_label = "playlist"
             if not tracks:
-                return await interaction.followup.send("❌ Couldn't load that playlist.")
+                return await interaction.followup.send(
+                    f"❌ Couldn't load that {source_label}. "
+                    f"{'Spotify playlists require the page to be public.' if is_sp_playlist else ''}"
+                )
             start_now = q.current is None and not q.voice_client.is_playing()
             for t in tracks:
                 q.tracks.append(t)
@@ -1849,7 +2084,7 @@ async def cmd_play(interaction: discord.Interaction, query: str):
                 q.current = q.tracks.popleft()
                 await _start_playing(interaction.guild, q)
             return await interaction.followup.send(
-                f"{'▶️ Starting' if start_now else '➕ Added'} **{len(tracks)} songs** from the playlist."
+                f"{'▶️ Starting' if start_now else '➕ Added'} **{len(tracks)} songs** from the {source_label}."
             )
 
         track = await fetch_track(query, str(interaction.user), uid)
@@ -2035,6 +2270,56 @@ async def cmd_search(interaction: discord.Interaction, query: str):
     embed.set_footer(text="Pick a song from the dropdown below")
     view = SearchView(entries[:5], interaction.guild, q, str(interaction.user), interaction.user.id)
     await interaction.followup.send(embed=embed, view=view)
+
+
+@bot.tree.command(name="radio", description="Start a YouTube radio mix from a seed song or search")
+@app_commands.describe(query="Song name or YouTube URL to start the radio from")
+@music_channel_only()
+async def cmd_radio(interaction: discord.Interaction, query: str):
+    await interaction.response.defer()
+    q = await ensure_voice(interaction)
+    if q is None:
+        return
+
+    # Step 1: find the seed track
+    seed_track = await fetch_track(query, str(interaction.user), interaction.user.id)
+    if not seed_track or isinstance(seed_track, str):
+        return await interaction.followup.send("❌ Couldn't find that song to seed the radio.")
+
+    # Step 2: get its YouTube video ID
+    vid_id_m = re.search(r"(?:v=|youtu\.be/)([A-Za-z0-9_-]{11})", seed_track.webpage_url)
+    mix_tracks: list[Track] = []
+
+    if vid_id_m:
+        vid_id  = vid_id_m.group(1)
+        mix_url = f"https://www.youtube.com/watch?v={vid_id}&list=RD{vid_id}"
+        print(f"[Radio] Fetching YouTube Mix: {mix_url}")
+        mix_tracks = await fetch_playlist(mix_url, str(interaction.user), interaction.user.id)
+
+    # Step 3: fall back to a search-based autoplay approach if the Mix failed
+    if not mix_tracks:
+        mix_tracks = [seed_track]
+
+    # Step 4: queue everything and turn on autoplay
+    q.autoplay = True
+    start_now  = q.current is None and not q.voice_client.is_playing()
+    for t in mix_tracks:
+        q.tracks.append(t)
+    if start_now and q.tracks:
+        q.current = q.tracks.popleft()
+        await _start_playing(interaction.guild, q)
+
+    await interaction.followup.send(
+        f"📻 **Radio started** — seeded from **{seed_track.title}**\n"
+        f"➕ Added **{len(mix_tracks)} song(s)** to the queue  ·  🔄 Autoplay **ON**"
+    )
+
+
+@cmd_radio.autocomplete("query")
+async def radio_autocomplete(interaction: discord.Interaction, current: str):
+    if not current or len(current) < 2:
+        return []
+    return await _search_suggestions(current)
 
 
 # ---------------------------------------------------------------------------
@@ -3101,9 +3386,10 @@ async def cmd_effects(interaction: discord.Interaction):
 async def cmd_help(interaction: discord.Interaction):
     embed = discord.Embed(title="🎵 Different Music — Commands", color=0x5865F2)
     embed.add_field(name="▶️ Playback",
-        value=("`/play` — Search or paste a YouTube/Spotify URL or playlist\n"
+        value=("`/play` — Search or paste a YouTube/Spotify URL, playlist, or album\n"
                "`/playnext` — Queue a song right after the current one\n"
                "`/search` — Pick from a 5-result dropdown\n"
+               "`/radio <seed>` — Start a YouTube Mix radio from any song\n"
                "`/pause` `/resume` `/stop` `/replay`\n"
                "`/seek <time>` — Jump to e.g. `1:30` or `90`"), inline=False)
     embed.add_field(name="📋 Queue",
@@ -3141,8 +3427,11 @@ async def cmd_help(interaction: discord.Interaction):
         value=(f"• DJ role: **{DJ_ROLE_NAME}** (server owner & admins always bypass)\n"
                f"• Max **{SONG_LIMIT}** queued songs per person\n"
                "• Now Playing card auto-updates every 20 s\n"
-               "• Paste a Spotify link and I'll find it on YouTube\n"
-               "• Buttons on the Now Playing card: ⏸️ ⏭️ 🔁 🔀"), inline=False)
+               "• Paste a Spotify link, playlist, or album — I'll find it on YouTube\n"
+               "• Buttons on the Now Playing card: ⏸️ ⏭️ 🔁 🔀\n"
+               + (f"• Song-request channel: <#{REQUEST_CHANNEL_ID}> — just type a song name!"
+                  if REQUEST_CHANNEL_ID else
+                  "• Song-request channel: set SONG_REQUEST_CHANNEL_ID in .env to enable")), inline=False)
     embed.set_footer(text="Different Music Bot")
     await interaction.response.send_message(embed=embed)
 
