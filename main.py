@@ -113,6 +113,8 @@ class Track:
     requester_avatar: str   = ""
     # Timestamp when the stream URL was fetched — used for TTL expiry checks
     fetched_at:       float = field(default_factory=time.monotonic)
+    # How many times we've auto-retried this track after a premature stream end
+    retry_count:      int   = 0
 
 
 @dataclass
@@ -154,6 +156,10 @@ class GuildQueue:
     session_listen_secs: int                       = 0
     # Auto-pause state — set when bot pauses because everyone left voice
     alone_paused:        bool                      = False
+    # Set True right before any intentional stop (skip/skipto/back/seek/effect
+    # change) so the player can tell a real transition apart from a stream that
+    # died and made FFmpeg exit early
+    manual_stop:      bool                      = False
 
 
 # Global state
@@ -961,6 +967,7 @@ class NowPlayingView(discord.ui.View):
         # DJs skip instantly — everyone else triggers a vote
         if has_dj_role(interaction.user):
             q.vote_skip_users.clear()
+            q.manual_stop = True
             q.voice_client.stop()
             return await interaction.response.send_message("⏭️ Skipped.", ephemeral=True)
         listeners   = [m for m in q.voice_client.channel.members if not m.bot]
@@ -971,6 +978,7 @@ class NowPlayingView(discord.ui.View):
         valid_votes = sum(1 for uid in q.vote_skip_users if any(m.id == uid for m in listeners))
         if valid_votes >= needed:
             q.vote_skip_users.clear()
+            q.manual_stop = True
             q.voice_client.stop()
             await interaction.response.send_message(f"⏭️ Vote skip passed! ({valid_votes}/{needed})")
         else:
@@ -1419,6 +1427,7 @@ async def _start_playing(guild: discord.Guild, q: GuildQueue,
         # e.g. "Already playing audio" — stop current and retry once
         print(f"[Player] ClientException on play(): {e} — stopping and retrying")
         try:
+            q.manual_stop = True   # internal restart — don't trip failure retry
             q.voice_client.stop()
             await asyncio.sleep(0.5)
             q.voice_client.play(source, after=after_play)
@@ -1483,14 +1492,11 @@ async def _prefetch_next(q: GuildQueue) -> None:
         return
     try:
         loop = asyncio.get_event_loop()
-        ydl_opts = {
-            "format":          "bestaudio/best",
-            "quiet":           True,
-            "no_warnings":     True,
-            "noplaylist":      True,
-        }
+        # Use the SAME hardened format as YDL_OPTS — otherwise prefetch caches a
+        # DASH stream URL that _resolve_stream trusts and plays, re-introducing
+        # the mid-song freezes the format fix was meant to eliminate.
         def _fetch():
-            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            with yt_dlp.YoutubeDL(YDL_OPTS) as ydl:
                 info = ydl.extract_info(next_track.webpage_url, download=False)
                 return info.get("url") if info else None
         url = await loop.run_in_executor(None, _fetch)
@@ -1513,6 +1519,12 @@ async def _play_next(guild: discord.Guild) -> None:
         if q is None:
             return
 
+        # Was this stop intentional (skip/skipto/back/seek/effect change)?
+        # Capture and clear up-front so the flag can't go stale across the
+        # early-return paths below.
+        manual_stop_was = q.manual_stop
+        q.manual_stop   = False
+
         # Honour seek/restart requests
         if q.restart_current:
             q.restart_current = False
@@ -1525,6 +1537,39 @@ async def _play_next(guild: discord.Guild) -> None:
         if q.loop_mode == "song" and q.current:
             await _start_playing(guild, q)
             return
+
+        # ── Premature stream-failure detection ───────────────────────────────
+        # When a stream URL dies mid-song, FFmpeg often exits *cleanly*, so this
+        # callback fires as if the song finished — manifesting as a random skip.
+        # If the track ended well before its real duration and wasn't skipped,
+        # re-resolve a fresh stream URL and resume from where it cut out.
+        cur = q.current
+        if (cur and not manual_stop_was and cur.duration_secs and q.play_start
+                and cur.retry_count < 2):
+            played = time.monotonic() - q.play_start
+            if q.paused_at:
+                played -= (time.monotonic() - q.paused_at)
+            played = max(0, played)
+            ended_early = (played < cur.duration_secs - 15
+                           and played < cur.duration_secs * 0.95)
+            if ended_early:
+                cur.retry_count += 1
+                cur.stream_url   = ""          # force a fresh resolve
+                cur.fetched_at   = 0
+                resume_at = int(max(0, played - 3))
+                print(f"[Player] '{cur.title}' ended early "
+                      f"({int(played)}s/{cur.duration_secs}s) — retry "
+                      f"#{cur.retry_count} from {resume_at}s")
+                if q.text_channel:
+                    try:
+                        await q.text_channel.send(
+                            f"🔁 Stream hiccup on **{cur.title}** — reconnecting…",
+                            delete_after=8,
+                        )
+                    except Exception:
+                        pass
+                await _start_playing(guild, q, seek_secs=resume_at)
+                return
 
         # Archive finished track and accumulate session listening time
         if q.current:
@@ -2344,6 +2389,7 @@ async def cmd_skip(interaction: discord.Interaction):
         return await interaction.response.send_message("❌ Join my voice channel first.", ephemeral=True)
     if has_dj_role(interaction.user):
         q.vote_skip_users.clear()
+        q.manual_stop = True
         q.voice_client.stop()
         return await interaction.response.send_message("⏭️ Skipped.")
     listeners = [m for m in q.voice_client.channel.members if not m.bot]
@@ -2354,6 +2400,7 @@ async def cmd_skip(interaction: discord.Interaction):
     valid_votes = sum(1 for uid in q.vote_skip_users if any(m.id == uid for m in listeners))
     if valid_votes >= needed:
         q.vote_skip_users.clear()
+        q.manual_stop = True
         q.voice_client.stop()
         await interaction.response.send_message(f"⏭️ Vote skip passed! ({valid_votes}/{needed})")
     else:
@@ -2378,6 +2425,7 @@ async def cmd_skipto(interaction: discord.Interaction, position: int):
         q.history.append(t)
     q.tracks = deque(lst[position - 1:])
     if q.voice_client and (q.voice_client.is_playing() or q.voice_client.is_paused()):
+        q.manual_stop = True
         q.voice_client.stop()
         await interaction.response.send_message(f"⏭️ Jumped to position **{position}**.")
     else:
@@ -2901,16 +2949,19 @@ async def cmd_previous(interaction: discord.Interaction):
         return await interaction.response.send_message("📭 No previous song in history.", ephemeral=True)
     if not q.voice_client or not q.voice_client.is_connected():
         return await interaction.response.send_message("❌ Not connected to a voice channel.", ephemeral=True)
-    prev = q.history[-1]          # most recent history entry
+    prev = q.history.pop()        # take (and remove) the most recent history entry
     # Put current song back at the front so it resumes after the previous
     if q.current:
         q.tracks.appendleft(q.current)
-    q.current         = prev
-    q.restart_current = False
-    q.seek_to         = 0
+    q.current = prev
+    q.seek_to = 0
     if q.voice_client.is_playing() or q.voice_client.is_paused():
-        q.voice_client.stop()     # triggers _play_next → restart_current path
+        # Route through the restart_current path so _play_next replays `prev`
+        # directly instead of archiving it and advancing to the next track.
+        q.restart_current = True
+        q.voice_client.stop()
     else:
+        q.restart_current = False
         await _start_playing(interaction.guild, q)
     await interaction.response.send_message(
         f"⏮️ Going back to **{prev.title}**.", ephemeral=False)
@@ -3337,11 +3388,16 @@ async def cmd_back(interaction: discord.Interaction):
     if q.current:
         q.tracks.appendleft(q.current)
     q.current = prev
+    q.seek_to = 0
 
     if q.voice_client and (q.voice_client.is_playing() or q.voice_client.is_paused()):
+        # Route through the restart_current path so _play_next replays `prev`
+        # directly instead of archiving it and advancing to the next track.
+        q.restart_current = True
         q.voice_client.stop()
         await interaction.response.send_message(f"⏮️ Going back to **{prev.title}**.")
     elif q.voice_client and q.voice_client.is_connected():
+        q.restart_current = False
         await _start_playing(interaction.guild, q)
         await interaction.response.send_message(f"⏮️ Playing **{prev.title}**.")
     else:
