@@ -115,6 +115,9 @@ class Track:
     fetched_at:       float = field(default_factory=time.monotonic)
     # How many times we've auto-retried this track after a premature stream end
     retry_count:      int   = 0
+    # HTTP headers (esp. User-Agent) yt-dlp used to obtain stream_url. Must be
+    # replayed to FFmpeg or YouTube returns 403 Forbidden on the googlevideo URL.
+    http_headers:     dict  = field(default_factory=dict)
 
 
 @dataclass
@@ -439,15 +442,25 @@ YDL_OPTS = {
 UNSUPPORTED_DOMAINS = ("music.apple.com", "tidal.com", "deezer.com")
 
 
+def _extract_stream(info: dict) -> tuple[str, dict]:
+    """Pull the playable stream URL and its matching HTTP headers out of a
+    yt-dlp info dict. The headers (esp. User-Agent) MUST be replayed to FFmpeg
+    or YouTube rejects the googlevideo URL with 403 Forbidden."""
+    url     = info.get("url", "")
+    headers = info.get("http_headers") or {}
+    if not url:
+        for fmt in reversed(info.get("formats", [])):
+            if fmt.get("acodec") != "none" and fmt.get("url"):
+                url     = fmt["url"]
+                headers = fmt.get("http_headers") or headers
+                break
+    return url, dict(headers)
+
+
 def _info_to_track(info: dict, requested_by: str, requested_by_id: int = 0) -> Track:
     thumbs    = info.get("thumbnails") or []
     thumbnail = thumbs[-1]["url"] if thumbs else info.get("thumbnail", "")
-    stream_url = info.get("url", "")
-    if not stream_url:
-        for fmt in reversed(info.get("formats", [])):
-            if fmt.get("acodec") != "none" and fmt.get("url"):
-                stream_url = fmt["url"]
-                break
+    stream_url, http_headers = _extract_stream(info)
     dur        = info.get("duration")
     vid_id     = info.get("id", "")
     # Always ensure a valid URL — some yt-dlp search results omit webpage_url
@@ -465,6 +478,7 @@ def _info_to_track(info: dict, requested_by: str, requested_by_id: int = 0) -> T
         requested_by    = requested_by,
         requested_by_id = requested_by_id,
         fetched_at      = time.monotonic(),
+        http_headers    = http_headers,
     )
 
 
@@ -597,6 +611,18 @@ def _make_source(track: Track, volume: float, seek_secs: int = 0,
                  bass: bool = False, audio_filter: Optional[str] = None,
                  eq_preset: str = "flat", speed: float = 1.0) -> discord.FFmpegOpusAudio:
     before_opts = FFMPEG_BEFORE_OPTS
+    # Replay yt-dlp's HTTP headers (esp. User-Agent) so the googlevideo URL
+    # isn't rejected with 403 Forbidden — these are input options, so they
+    # must sit in before_options (before FFmpeg's -i).
+    hdrs = track.http_headers or {}
+    ua = hdrs.get("User-Agent")
+    if ua:
+        before_opts = f'-user_agent "{ua}" ' + before_opts
+    extra = "".join(
+        f"{k}: {v}\r\n" for k, v in hdrs.items() if k.lower() != "user-agent"
+    )
+    if extra:
+        before_opts = f'-headers "{extra}" ' + before_opts
     if seek_secs > 0:
         before_opts = f"-ss {seek_secs} " + before_opts
 
@@ -654,6 +680,7 @@ async def _resolve_stream(track: Track) -> bool:
         info     = await asyncio.wait_for(loop.run_in_executor(None, _extract), timeout=20)
         resolved = _info_to_track(info, track.requested_by, track.requested_by_id)
         track.stream_url    = resolved.stream_url
+        track.http_headers  = resolved.http_headers
         track.title         = resolved.title
         track.duration      = resolved.duration
         track.duration_secs = resolved.duration_secs
@@ -1498,11 +1525,12 @@ async def _prefetch_next(q: GuildQueue) -> None:
         def _fetch():
             with yt_dlp.YoutubeDL(YDL_OPTS) as ydl:
                 info = ydl.extract_info(next_track.webpage_url, download=False)
-                return info.get("url") if info else None
-        url = await loop.run_in_executor(None, _fetch)
+                return _extract_stream(info) if info else ("", {})
+        url, headers = await loop.run_in_executor(None, _fetch)
         if url:
-            next_track.stream_url = url
-            next_track.fetched_at = time.monotonic()
+            next_track.stream_url   = url
+            next_track.http_headers = headers
+            next_track.fetched_at   = time.monotonic()
             print(f"[Prefetch] ✓ Pre-fetched stream for '{next_track.title}'")
     except Exception as e:
         print(f"[Prefetch] Failed for '{next_track.title}': {e}")
