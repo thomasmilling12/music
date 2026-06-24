@@ -52,8 +52,9 @@ if not TOKEN:
 # ---------------------------------------------------------------------------
 
 FFMPEG_BEFORE_OPTS = (
-    "-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5 "
-    "-thread_queue_size 512"
+    "-reconnect 1 -reconnect_streamed 1 -reconnect_at_eof 1 "
+    "-reconnect_delay_max 5 -multiple_requests 1 "
+    "-thread_queue_size 4096"
 )
 
 # ---------------------------------------------------------------------------
@@ -415,11 +416,18 @@ async def _spotify_title(url: str) -> Optional[str]:
 # ---------------------------------------------------------------------------
 
 YDL_OPTS = {
-    "format": "bestaudio[acodec=opus]/bestaudio[ext=webm]/bestaudio[protocol=https]/bestaudio",
-    "quiet":       True,
-    "no_warnings": True,
+    # Prefer a single-file HTTPS progressive stream — avoids DASH segments whose
+    # per-chunk URLs expire mid-song, causing cut-outs and freezes on slow hardware.
+    # Falls back to bestaudio only if no plain HTTPS audio stream exists.
+    "format": (
+        "bestaudio[protocol=https][acodec!=none]"
+        "/bestaudio[protocol=http][acodec!=none]"
+        "/bestaudio"
+    ),
+    "quiet":        True,
+    "no_warnings":  True,
     "extract_flat": False,
-    "noplaylist":  True,
+    "noplaylist":   True,
 }
 
 UNSUPPORTED_DOMAINS = ("music.apple.com", "tidal.com", "deezer.com")
