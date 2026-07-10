@@ -51,8 +51,13 @@ if not TOKEN:
 # FFmpeg options — reconnect flags prevent drop-outs mid-stream
 # ---------------------------------------------------------------------------
 
+# NOTE: no -reconnect_at_eof — on progressive (non-live) audio it forces a
+# reconnect at the *natural* end of a song, stalling for -reconnect_delay_max
+# seconds and leaving the voice client stuck (the "have to disconnect the bot
+# to get music playing" symptom). -reconnect_streamed handles genuine mid-song
+# connection drops on its own.
 FFMPEG_BEFORE_OPTS = (
-    "-reconnect 1 -reconnect_streamed 1 -reconnect_at_eof 1 "
+    "-reconnect 1 -reconnect_streamed 1 "
     "-reconnect_delay_max 5 -multiple_requests 1 "
     "-thread_queue_size 4096"
 )
@@ -611,18 +616,15 @@ def _make_source(track: Track, volume: float, seek_secs: int = 0,
                  bass: bool = False, audio_filter: Optional[str] = None,
                  eq_preset: str = "flat", speed: float = 1.0) -> discord.FFmpegOpusAudio:
     before_opts = FFMPEG_BEFORE_OPTS
-    # Replay yt-dlp's HTTP headers (esp. User-Agent) so the googlevideo URL
-    # isn't rejected with 403 Forbidden — these are input options, so they
-    # must sit in before_options (before FFmpeg's -i).
+    # Replay only the User-Agent (an input option, before FFmpeg's -i) so the
+    # googlevideo URL isn't rejected with 403 Forbidden — that UA match is what
+    # YouTube checks. Do NOT forward the rest of yt-dlp's headers: Accept-Encoding
+    # in particular can make the server send gzip/br-compressed bytes that FFmpeg
+    # feeds straight into the decoder as garbage, producing static/garbled audio.
     hdrs = track.http_headers or {}
     ua = hdrs.get("User-Agent")
     if ua:
         before_opts = f'-user_agent "{ua}" ' + before_opts
-    extra = "".join(
-        f"{k}: {v}\r\n" for k, v in hdrs.items() if k.lower() != "user-agent"
-    )
-    if extra:
-        before_opts = f'-headers "{extra}" ' + before_opts
     if seek_secs > 0:
         before_opts = f"-ss {seek_secs} " + before_opts
 
@@ -652,8 +654,12 @@ def _make_source(track: Track, volume: float, seek_secs: int = 0,
     if filters:
         options += f" -af {','.join(filters)}"
 
+    # 96 kbps Opus is transparent for music over Discord and roughly halves the
+    # real-time encode cost vs the 128 k default — important on a Raspberry Pi,
+    # where encode underruns are what make playback choppy.
     return discord.FFmpegOpusAudio(
         track.stream_url,
+        bitrate=96,
         before_options=before_opts,
         options=options,
     )
