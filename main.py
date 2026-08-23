@@ -7,6 +7,8 @@ import math
 import os
 import random
 import re
+import shlex
+import threading
 import time
 import traceback
 import urllib.parse
@@ -34,7 +36,10 @@ GUILD_ID         = 850386896509337710
 DJ_ROLE_NAME     = os.getenv("DJ_ROLE_NAME", "DJ")
 SONG_LIMIT       = int(os.getenv("SONG_LIMIT_PER_USER", "5"))  # 0 = unlimited
 IDLE_TIMEOUT     = 300    # seconds of silence before auto-leaving
-STREAM_TTL       = 18000  # re-fetch stream URL after 5 hours (YouTube URLs expire)
+STREAM_TTL       = 3600   # conservative fallback; signed URLs may be revoked early
+STREAM_EXPIRY_MARGIN = 300
+MAX_STREAM_RETRIES = 3
+MAX_VOLUME       = 1.0
 BOT_START        = time.monotonic()
 # Any valid Twitch URL — only needed so Discord shows the purple streaming indicator
 TWITCH_URL       = os.getenv("TWITCH_URL", "https://twitch.tv/discord")
@@ -58,9 +63,34 @@ if not TOKEN:
 # connection drops on its own.
 FFMPEG_BEFORE_OPTS = (
     "-reconnect 1 -reconnect_streamed 1 "
-    "-reconnect_delay_max 5 -multiple_requests 1 "
+    "-reconnect_delay_max 3 -multiple_requests 1 "
+    "-rw_timeout 15000000 -loglevel warning "
     "-thread_queue_size 4096"
 )
+
+
+class _BoundedStderr:
+    """Thread-safe rolling FFmpeg stderr sink used by discord.py's pipe reader."""
+
+    def __init__(self, limit: int = 64 * 1024):
+        self.limit = limit
+        self._data = bytearray()
+        self._lock = threading.Lock()
+
+    def write(self, data: bytes) -> int:
+        if not data:
+            return 0
+        with self._lock:
+            self._data.extend(data)
+            overflow = len(self._data) - self.limit
+            if overflow > 0:
+                del self._data[:overflow]
+        return len(data)
+
+    def snapshot(self) -> bytes:
+        with self._lock:
+            return bytes(self._data)
+
 
 # ---------------------------------------------------------------------------
 # Audio filters & EQ presets
@@ -123,6 +153,8 @@ class Track:
     # HTTP headers (esp. User-Agent) yt-dlp used to obtain stream_url. Must be
     # replayed to FFmpeg or YouTube returns 403 Forbidden on the googlevideo URL.
     http_headers:     dict  = field(default_factory=dict)
+    # Monotonic deadline derived from the signed URL's `expire` parameter.
+    stream_expires_at: float = 0.0
 
 
 @dataclass
@@ -134,6 +166,7 @@ class GuildQueue:
     volume:          float                         = 1.0
     loop_mode:       str                           = "off"   # "off" | "song" | "queue"
     play_start:      Optional[float]               = None
+    start_position:  int                           = 0
     idle_task:       Optional[asyncio.Task]        = None
     history:         deque                         = field(default_factory=lambda: deque(maxlen=10))
     songs_played:    int                           = 0
@@ -164,10 +197,12 @@ class GuildQueue:
     session_listen_secs: int                       = 0
     # Auto-pause state — set when bot pauses because everyone left voice
     alone_paused:        bool                      = False
-    # Set True right before any intentional stop (skip/skipto/back/seek/effect
-    # change) so the player can tell a real transition apart from a stream that
-    # died and made FFmpeg exit early
-    manual_stop:      bool                      = False
+    # Each FFmpeg source gets an ID. Intentional stops are recorded against that
+    # exact source so a delayed callback cannot consume another source's state.
+    playback_id:       int                       = 0
+    manual_stop_ids:   set[int]                  = field(default_factory=set)
+    transition_id:     int                       = 0
+    pause_after_restart: bool                    = False
 
 
 # Global state
@@ -185,6 +220,54 @@ def get_play_lock(guild_id: int) -> asyncio.Lock:
     if guild_id not in _play_locks:
         _play_locks[guild_id] = asyncio.Lock()
     return _play_locks[guild_id]
+
+
+def _active_playback_seconds(q: GuildQueue, now: Optional[float] = None) -> float:
+    """Wall-clock seconds this source has actively played, excluding pauses."""
+    if q.play_start is None:
+        return 0.0
+    now = time.monotonic() if now is None else now
+    active = now - q.play_start
+    if q.paused_at is not None:
+        active -= now - q.paused_at
+    return max(0.0, active)
+
+
+def _playback_position(q: GuildQueue, now: Optional[float] = None) -> int:
+    """Current media position, including seeks and playback speed."""
+    speed = q.speed if not q.audio_filter else 1.0
+    position = q.start_position + (_active_playback_seconds(q, now) * speed)
+    if q.current and q.current.duration_secs:
+        position = min(position, q.current.duration_secs)
+    return max(0, int(position))
+
+
+def _resume_playback_clock(q: GuildQueue) -> None:
+    """Exclude a completed pause from all future progress calculations."""
+    if q.paused_at is not None and q.play_start is not None:
+        q.play_start += time.monotonic() - q.paused_at
+    q.paused_at = None
+
+
+def _stop_for_transition(q: GuildQueue, *, bump_transition: bool = True) -> None:
+    """Stop the active source and mark only its callback as intentional."""
+    if bump_transition:
+        q.transition_id += 1
+    if not q.voice_client:
+        return
+    if q.playback_id:
+        q.manual_stop_ids.add(q.playback_id)
+    q.voice_client.stop()
+
+
+def _request_restart(q: GuildQueue, position: int) -> None:
+    """Queue a source replacement that remains valid even between sources."""
+    q.restart_current = True
+    q.seek_to = max(0, position)
+    q.transition_id += 1
+    if (q.voice_client
+            and (q.voice_client.is_playing() or q.voice_client.is_paused())):
+        _stop_for_transition(q, bump_transition=False)
 
 
 def _cleanup_guild(guild_id: int) -> None:
@@ -246,7 +329,7 @@ def est_wait(q: GuildQueue, up_to_index: Optional[int] = None) -> int:
     end = len(lst) if up_to_index is None else up_to_index
     secs = sum(t.duration_secs or 0 for t in lst[:end])
     if q.current and q.play_start and q.current.duration_secs:
-        elapsed = int(time.monotonic() - q.play_start)
+        elapsed = _playback_position(q)
         secs += max(0, q.current.duration_secs - elapsed)
     return secs
 
@@ -447,7 +530,20 @@ YDL_OPTS = {
 UNSUPPORTED_DOMAINS = ("music.apple.com", "tidal.com", "deezer.com")
 
 
-def _extract_stream(info: dict) -> tuple[str, dict]:
+def _stream_deadline(url: str) -> float:
+    """Return a conservative monotonic deadline for a signed media URL."""
+    fallback = time.monotonic() + STREAM_TTL
+    try:
+        expiry_values = urllib.parse.parse_qs(urllib.parse.urlparse(url).query).get("expire")
+        if not expiry_values:
+            return fallback
+        remaining = float(expiry_values[0]) - time.time() - STREAM_EXPIRY_MARGIN
+        return min(fallback, time.monotonic() + max(0.0, remaining))
+    except (TypeError, ValueError, OverflowError):
+        return fallback
+
+
+def _extract_stream(info: dict) -> tuple[str, dict, float]:
     """Pull the playable stream URL and its matching HTTP headers out of a
     yt-dlp info dict. The headers (esp. User-Agent) MUST be replayed to FFmpeg
     or YouTube rejects the googlevideo URL with 403 Forbidden."""
@@ -459,13 +555,13 @@ def _extract_stream(info: dict) -> tuple[str, dict]:
                 url     = fmt["url"]
                 headers = fmt.get("http_headers") or headers
                 break
-    return url, dict(headers)
+    return url, dict(headers), _stream_deadline(url)
 
 
 def _info_to_track(info: dict, requested_by: str, requested_by_id: int = 0) -> Track:
     thumbs    = info.get("thumbnails") or []
     thumbnail = thumbs[-1]["url"] if thumbs else info.get("thumbnail", "")
-    stream_url, http_headers = _extract_stream(info)
+    stream_url, http_headers, stream_expires_at = _extract_stream(info)
     dur        = info.get("duration")
     vid_id     = info.get("id", "")
     # Always ensure a valid URL — some yt-dlp search results omit webpage_url
@@ -484,6 +580,7 @@ def _info_to_track(info: dict, requested_by: str, requested_by_id: int = 0) -> T
         requested_by_id = requested_by_id,
         fetched_at      = time.monotonic(),
         http_headers    = http_headers,
+        stream_expires_at = stream_expires_at,
     )
 
 
@@ -622,9 +719,12 @@ def _make_source(track: Track, volume: float, seek_secs: int = 0,
     # in particular can make the server send gzip/br-compressed bytes that FFmpeg
     # feeds straight into the decoder as garbage, producing static/garbled audio.
     hdrs = track.http_headers or {}
-    ua = hdrs.get("User-Agent")
+    ua = hdrs.get("User-Agent") or hdrs.get("user-agent")
     if ua:
-        before_opts = f'-user_agent "{ua}" ' + before_opts
+        before_opts = f"-user_agent {shlex.quote(str(ua))} " + before_opts
+    referer = hdrs.get("Referer") or hdrs.get("referer")
+    if referer:
+        before_opts = f"-referer {shlex.quote(str(referer))} " + before_opts
     if seek_secs > 0:
         before_opts = f"-ss {seek_secs} " + before_opts
 
@@ -638,17 +738,26 @@ def _make_source(track: Track, volume: float, seek_secs: int = 0,
         if abs(speed - 1.0) > 0.01:
             filters.append(_atempo_chain(speed))
         # 3. Legacy bass boost toggle
-        if bass:
+        if bass and eq_preset == "flat":
             filters.append("bass=g=6")
 
-    # 4. EQ preset (stacked on top of everything)
-    eq = EQ_PRESETS.get(eq_preset)
+    # 4. A named filter owns the DSP chain. Avoid stacking EQ on reverb/8D/etc.
+    # on the Pi, where the extra real-time filters cause encode underruns.
+    eq = EQ_PRESETS.get(eq_preset) if not audio_filter else None
     if eq:
         filters.append(eq)
 
-    # 5. Volume
-    if abs(volume - 1.0) > 0.005:
-        filters.append(f"volume={volume}")
+    # 5. Gain protection. Positive EQ/bass boosts need headroom before Opus
+    # encoding; a limiter catches remaining peaks instead of clipping them.
+    safe_volume = min(MAX_VOLUME, max(0.0, volume))
+    if (bass and not eq) or eq:
+        safe_volume *= 0.72
+    elif audio_filter:
+        safe_volume *= 0.85
+    if abs(safe_volume - 1.0) > 0.005:
+        filters.append(f"volume={safe_volume:.3f}")
+    if filters:
+        filters.append("alimiter=limit=0.95:attack=5:release=50")
 
     options = "-vn"
     if filters:
@@ -657,18 +766,26 @@ def _make_source(track: Track, volume: float, seek_secs: int = 0,
     # 96 kbps Opus is transparent for music over Discord and roughly halves the
     # real-time encode cost vs the 128 k default — important on a Raspberry Pi,
     # where encode underruns are what make playback choppy.
-    return discord.FFmpegOpusAudio(
+    stderr_capture = _BoundedStderr()
+    source = discord.FFmpegOpusAudio(
         track.stream_url,
         bitrate=96,
         before_options=before_opts,
         options=options,
+        stderr=stderr_capture,
     )
+    source.stderr_capture = stderr_capture
+    return source
 
 
 async def _resolve_stream(track: Track) -> bool:
     """Ensure the track has a valid, non-expired stream URL.
     Re-fetches if the URL is missing or older than STREAM_TTL seconds."""
-    expired = time.monotonic() - track.fetched_at > STREAM_TTL
+    now = time.monotonic()
+    expired = (
+        now - track.fetched_at > STREAM_TTL
+        or (track.stream_expires_at > 0 and now >= track.stream_expires_at)
+    )
     if track.stream_url and not expired:
         return True
 
@@ -687,6 +804,7 @@ async def _resolve_stream(track: Track) -> bool:
         resolved = _info_to_track(info, track.requested_by, track.requested_by_id)
         track.stream_url    = resolved.stream_url
         track.http_headers  = resolved.http_headers
+        track.stream_expires_at = resolved.stream_expires_at
         track.title         = resolved.title
         track.duration      = resolved.duration
         track.duration_secs = resolved.duration_secs
@@ -741,11 +859,7 @@ def _np_embed(track: Track, q: GuildQueue,
         color       = 0x5865F2,
     )
     if play_start and track.duration_secs:
-        now     = time.monotonic()
-        elapsed = int(now - play_start)
-        if q.paused_at:
-            elapsed -= int(now - q.paused_at)
-        elapsed = max(0, min(elapsed, track.duration_secs))
+        elapsed = _playback_position(q)
         embed.add_field(name="\u200b", value=progress_bar(elapsed, track.duration_secs), inline=False)
     else:
         embed.add_field(name="Duration", value=track.duration, inline=True)
@@ -981,9 +1095,7 @@ class NowPlayingView(discord.ui.View):
             button.emoji = "▶️"
             await interaction.response.edit_message(view=self)
         elif q.voice_client.is_paused():
-            if q.paused_at and q.play_start:
-                q.play_start += time.monotonic() - q.paused_at
-            q.paused_at  = None
+            _resume_playback_clock(q)
             q.voice_client.resume()
             button.emoji = "⏸️"
             await interaction.response.edit_message(view=self)
@@ -1000,8 +1112,7 @@ class NowPlayingView(discord.ui.View):
         # DJs skip instantly — everyone else triggers a vote
         if has_dj_role(interaction.user):
             q.vote_skip_users.clear()
-            q.manual_stop = True
-            q.voice_client.stop()
+            _stop_for_transition(q)
             return await interaction.response.send_message("⏭️ Skipped.", ephemeral=True)
         listeners   = [m for m in q.voice_client.channel.members if not m.bot]
         needed      = max(1, math.ceil(len(listeners) / 2))
@@ -1011,8 +1122,7 @@ class NowPlayingView(discord.ui.View):
         valid_votes = sum(1 for uid in q.vote_skip_users if any(m.id == uid for m in listeners))
         if valid_votes >= needed:
             q.vote_skip_users.clear()
-            q.manual_stop = True
-            q.voice_client.stop()
+            _stop_for_transition(q)
             await interaction.response.send_message(f"⏭️ Vote skip passed! ({valid_votes}/{needed})")
         else:
             await interaction.response.send_message(
@@ -1056,15 +1166,9 @@ class NowPlayingView(discord.ui.View):
         if not has_dj_role(interaction.user):
             return await interaction.response.send_message(
                 f"❌ You need the **{DJ_ROLE_NAME}** role.", ephemeral=True)
-        now     = time.monotonic()
-        elapsed = int(now - q.play_start) if q.play_start else 0
-        if q.paused_at:
-            elapsed -= int(now - q.paused_at)
+        elapsed = _playback_position(q)
         new_pos = max(0, elapsed - 30)
-        q.restart_current = True
-        q.seek_to         = new_pos
-        if q.voice_client and (q.voice_client.is_playing() or q.voice_client.is_paused()):
-            q.voice_client.stop()
+        _request_restart(q, new_pos)
         await interaction.response.send_message(f"⏪ Back 30s → `{fmt_dur(new_pos)}`", ephemeral=True)
 
     @discord.ui.button(emoji="⏩", style=discord.ButtonStyle.secondary, custom_id="np_seek_fwd", row=1)
@@ -1077,16 +1181,10 @@ class NowPlayingView(discord.ui.View):
         if not has_dj_role(interaction.user):
             return await interaction.response.send_message(
                 f"❌ You need the **{DJ_ROLE_NAME}** role.", ephemeral=True)
-        now     = time.monotonic()
-        elapsed = int(now - q.play_start) if q.play_start else 0
-        if q.paused_at:
-            elapsed -= int(now - q.paused_at)
+        elapsed = _playback_position(q)
         dur     = q.current.duration_secs or 0
         new_pos = min(elapsed + 30, max(0, dur - 2))
-        q.restart_current = True
-        q.seek_to         = new_pos
-        if q.voice_client and (q.voice_client.is_playing() or q.voice_client.is_paused()):
-            q.voice_client.stop()
+        _request_restart(q, new_pos)
         await interaction.response.send_message(f"⏩ Forward 30s → `{fmt_dur(new_pos)}`", ephemeral=True)
 
     @discord.ui.button(emoji="❤️", style=discord.ButtonStyle.secondary, custom_id="np_favorite", row=2)
@@ -1129,10 +1227,8 @@ class NowPlayingView(discord.ui.View):
             return await interaction.response.send_message("🔇 Already at minimum volume.", ephemeral=True)
         q.volume = new_vol
         if q.voice_client and q.current and (q.voice_client.is_playing() or q.voice_client.is_paused()):
-            elapsed       = int(time.monotonic() - q.play_start) if q.play_start else 0
-            q.restart_current = True
-            q.seek_to         = elapsed
-            q.voice_client.stop()
+            elapsed       = _playback_position(q)
+            _request_restart(q, elapsed)
         await interaction.response.send_message(f"🔉 Volume → **{int(new_vol * 100)}%**", ephemeral=True)
 
     @discord.ui.button(emoji="🔊", style=discord.ButtonStyle.secondary, custom_id="np_vol_up", row=3)
@@ -1145,15 +1241,13 @@ class NowPlayingView(discord.ui.View):
         if not has_dj_role(interaction.user):
             return await interaction.response.send_message(
                 f"❌ You need the **{DJ_ROLE_NAME}** role.", ephemeral=True)
-        new_vol = min(2.0, q.volume + 0.1)
+        new_vol = min(MAX_VOLUME, q.volume + 0.1)
         if abs(new_vol - q.volume) < 0.005:
-            return await interaction.response.send_message("🔊 Already at maximum volume (200%).", ephemeral=True)
+            return await interaction.response.send_message("🔊 Already at maximum volume (100%).", ephemeral=True)
         q.volume = new_vol
         if q.voice_client and q.current and (q.voice_client.is_playing() or q.voice_client.is_paused()):
-            elapsed       = int(time.monotonic() - q.play_start) if q.play_start else 0
-            q.restart_current = True
-            q.seek_to         = elapsed
-            q.voice_client.stop()
+            elapsed       = _playback_position(q)
+            _request_restart(q, elapsed)
         await interaction.response.send_message(f"🔊 Volume → **{int(new_vol * 100)}%**", ephemeral=True)
 
 
@@ -1183,12 +1277,8 @@ class QueueView(discord.ui.View):
         lines = []
         if self.q.current and self.page == 0:
             # Show live progress inline for the current song
-            if self.q.play_start and self.q.current.duration_secs:
-                now     = time.monotonic()
-                elapsed = int(now - self.q.play_start)
-                if self.q.paused_at:
-                    elapsed -= int(now - self.q.paused_at)
-                elapsed  = max(0, min(elapsed, self.q.current.duration_secs))
+            if self.q.play_start is not None and self.q.current.duration_secs:
+                elapsed = _playback_position(self.q)
                 progress = f"`{fmt_dur(elapsed)}/{self.q.current.duration}`"
                 status   = "⏸️" if self.q.voice_client and self.q.voice_client.is_paused() else "▶️"
             else:
@@ -1398,44 +1488,172 @@ async def _update_presence(track: Optional[Track], is_playing: bool = False) -> 
         pass
 
 
+def _ffmpeg_diagnostics(source: discord.FFmpegOpusAudio) -> str:
+    """Return a short, single-line tail of FFmpeg stderr for service logs."""
+    capture = getattr(source, "stderr_capture", None)
+    if capture is None:
+        return ""
+    try:
+        raw = capture.snapshot()
+        text = raw.decode("utf-8", errors="replace")
+        return " ".join(text.strip().split())[-1200:]
+    except Exception:
+        return ""
+
+
+def _diagnostic_failure(diag: str) -> str:
+    """Promote useful FFmpeg warnings to a recoverable stream failure."""
+    lowered = diag.lower()
+    markers = (
+        "403 forbidden", "http error", "connection reset", "connection timed out",
+        "end of file", "invalid data", "server returned", "i/o error",
+    )
+    return diag if any(marker in lowered for marker in markers) else ""
+
+
+def _invalidate_stream(track: Track) -> None:
+    track.stream_url = ""
+    track.http_headers = {}
+    track.stream_expires_at = 0
+    track.fetched_at = 0
+
+
+def _start_state_changed(guild: discord.Guild, q: GuildQueue, track: Track,
+                         transition_id: int) -> bool:
+    return (
+        queues.get(guild.id) is not q
+        or q.current is not track
+        or q.transition_id != transition_id
+    )
+
+
+async def _honor_pending_restart(guild: discord.Guild, q: GuildQueue,
+                                 track: Track) -> None:
+    """Honor the user transition that superseded an obsolete start attempt."""
+    if queues.get(guild.id) is not q or q.current is not track:
+        return
+    if q.restart_current:
+        q.restart_current = False
+        requested_seek = q.seek_to
+        q.seek_to = 0
+        await _start_playing(guild, q, seek_secs=requested_seek)
+    else:
+        # A skip can stop a source while no reliable `after` callback exists
+        # (for example during URL-resolution backoff). Advance explicitly; the
+        # identity/generation guard makes a concurrent late callback harmless.
+        asyncio.create_task(_play_next(
+            guild,
+            intentional_advance=True,
+            expected_current=track,
+            expected_transition=q.transition_id,
+        ))
+
+
+async def _retry_start(guild: discord.Guild, q: GuildQueue, track: Track,
+                       seek_secs: int, send_np: bool, transition_id: int,
+                       reason: str, exhausted_message: str = "") -> None:
+    """Retry one failed start without overriding a newer queue transition."""
+    track.retry_count += 1
+    _invalidate_stream(track)
+
+    if track.retry_count <= MAX_STREAM_RETRIES:
+        delay = (0.5, 1.5, 3.0)[track.retry_count - 1]
+        print(f"[Player] {reason} for '{track.title}' — retry "
+              f"{track.retry_count}/{MAX_STREAM_RETRIES} in {delay:.1f}s")
+        await asyncio.sleep(delay)
+        if _start_state_changed(guild, q, track, transition_id):
+            print("[Player] Start retry cancelled by a newer transition")
+            await _honor_pending_restart(guild, q, track)
+            return
+        await _start_playing(guild, q, seek_secs=seek_secs, send_np=send_np)
+        return
+
+    if _start_state_changed(guild, q, track, transition_id):
+        await _honor_pending_restart(guild, q, track)
+        return
+
+    print(f"[Player] {reason} for '{track.title}' after retries")
+    if exhausted_message and q.text_channel:
+        try:
+            await q.text_channel.send(exhausted_message)
+        except Exception:
+            pass
+    asyncio.create_task(_play_next(
+        guild,
+        force_advance=True,
+        expected_current=track,
+        expected_transition=transition_id,
+    ))
+
+
 async def _start_playing(guild: discord.Guild, q: GuildQueue,
                           seek_secs: int = 0, send_np: bool = True) -> None:
     """Start audio playback for q.current. Resolves stream URL, builds FFmpeg source."""
     if not q.voice_client or q.current is None:
         return
     if not q.voice_client.is_connected():
-        print("[Player] Voice client not connected — aborting playback")
-        q.current = None
+        print("[Player] Voice client not connected — scheduling reconnect")
+        asyncio.create_task(_handle_voice_drop(guild))
         return
+
+    track = q.current
+    transition_id = q.transition_id
 
     # Capture BEFORE resolving so we can warn the channel after a successful re-fetch
     stream_was_expired = (
-        bool(q.current.stream_url) and
-        (time.monotonic() - q.current.fetched_at > STREAM_TTL)
+        bool(track.stream_url) and (
+            time.monotonic() - track.fetched_at > STREAM_TTL
+            or (track.stream_expires_at > 0
+                and time.monotonic() >= track.stream_expires_at)
+        )
     )
 
-    if not await _resolve_stream(q.current):
-        failed_title = q.current.title
-        print(f"[Player] Could not resolve stream for '{failed_title}' — skipping")
-        if q.text_channel:
-            try:
-                await q.text_channel.send(
-                    f"⚠️ Skipped **{failed_title}** — couldn't load the audio stream. "
-                    f"(The video may be unavailable, age-restricted, or geo-blocked.)"
-                )
-            except Exception:
-                pass
-        await _play_next(guild)
+    resolved = await _resolve_stream(track)
+    if _start_state_changed(guild, q, track, transition_id):
+        await _honor_pending_restart(guild, q, track)
+        return
+    if not resolved:
+        await _retry_start(
+            guild, q, track, seek_secs, send_np, transition_id,
+            "Could not resolve stream",
+            f"⚠️ Skipped **{track.title}** — couldn't load the audio stream. "
+            f"(The video may be unavailable, age-restricted, or geo-blocked.)",
+        )
         return
 
-    source = _make_source(
-        q.current, q.volume, seek_secs,
-        bass         = q.bass_boost,
-        audio_filter = q.audio_filter,
-        eq_preset    = q.eq_preset,
-        speed        = q.speed,
-    )
-    q.play_start = time.monotonic() - seek_secs
+    try:
+        source = _make_source(
+            track, q.volume, seek_secs,
+            bass         = q.bass_boost,
+            audio_filter = q.audio_filter,
+            eq_preset    = q.eq_preset,
+            speed        = q.speed,
+        )
+    except Exception as e:
+        await _retry_start(
+            guild, q, track, seek_secs, send_np, transition_id,
+            f"Could not construct FFmpeg source ({type(e).__name__}: {e})",
+            f"⚠️ Skipped **{track.title}** — FFmpeg couldn't start the audio source.",
+        )
+        return
+    # If a source is unexpectedly still active, invalidate its callback before
+    # stopping it. This prevents the old callback from advancing the new source.
+    next_playback_id = q.playback_id + 1
+    if q.voice_client.is_playing() or q.voice_client.is_paused():
+        if q.playback_id:
+            q.manual_stop_ids.add(q.playback_id)
+        q.playback_id = next_playback_id
+        q.voice_client.stop()
+        await asyncio.sleep(0.2)
+        if _start_state_changed(guild, q, track, transition_id):
+            source.cleanup()
+            await _honor_pending_restart(guild, q, track)
+            return
+    else:
+        q.playback_id = next_playback_id
+
+    q.play_start = time.monotonic()
+    q.start_position = max(0, seek_secs)
     q.paused_at  = None
     q.vote_skip_users.clear()
 
@@ -1443,37 +1661,47 @@ async def _start_playing(guild: discord.Guild, q: GuildQueue,
         q.idle_task.cancel()
         q.idle_task = None
 
+    playback_id = q.playback_id
+
     def after_play(error):
+        diag = _ffmpeg_diagnostics(source)
+        if diag:
+            print(f"[FFmpeg:{playback_id}] {diag}")
         if error:
-            print(f"[Player] Playback error: {error!r}")
+            print(f"[Player:{playback_id}] Playback error: {error!r}")
             err_str = str(error)
             if "4006" in err_str or "ConnectionClosed" in type(error).__name__:
                 asyncio.run_coroutine_threadsafe(
                     _handle_voice_drop(guild), guild._state.loop
                 )
                 return
-        asyncio.run_coroutine_threadsafe(_play_next(guild), guild._state.loop)
+        failure = str(error) if error else _diagnostic_failure(diag)
+        asyncio.run_coroutine_threadsafe(
+            _play_next(guild, playback_id=playback_id, playback_error=failure),
+            guild._state.loop,
+        )
 
     try:
         q.voice_client.play(source, after=after_play)
-    except discord.ClientException as e:
-        # e.g. "Already playing audio" — stop current and retry once
-        print(f"[Player] ClientException on play(): {e} — stopping and retrying")
-        try:
-            q.manual_stop = True   # internal restart — don't trip failure retry
-            q.voice_client.stop()
-            await asyncio.sleep(0.5)
-            q.voice_client.play(source, after=after_play)
-        except Exception as retry_err:
-            print(f"[Player] Retry also failed: {retry_err}")
-            q.current = None
-            return
     except Exception as e:
-        print(f"[Player] Unexpected error starting playback: {e}")
-        q.current = None
+        source.cleanup()
+        diag = _ffmpeg_diagnostics(source)
+        detail = f"{type(e).__name__}: {e}"
+        if diag:
+            detail += f" — {diag}"
+        await _retry_start(
+            guild, q, track, seek_secs, send_np, transition_id,
+            f"Could not start FFmpeg ({detail})",
+            f"⚠️ Skipped **{track.title}** — FFmpeg couldn't begin playback.",
+        )
         return
-    print(f"[Player] ▶ {q.current.title}")
-    asyncio.create_task(_update_presence(q.current, is_playing=True))
+    if q.pause_after_restart:
+        q.voice_client.pause()
+        q.paused_at = time.monotonic()
+        q.pause_after_restart = False
+        print(f"[Player:{playback_id}] Restored paused state")
+    print(f"[Player:{playback_id}] ▶ {track.title} at {seek_secs}s")
+    asyncio.create_task(_update_presence(track, is_playing=True))
 
     # Pre-fetch the next song's stream URL in the background to reduce inter-track gap
     if q.prefetch_task:
@@ -1531,33 +1759,54 @@ async def _prefetch_next(q: GuildQueue) -> None:
         def _fetch():
             with yt_dlp.YoutubeDL(YDL_OPTS) as ydl:
                 info = ydl.extract_info(next_track.webpage_url, download=False)
-                return _extract_stream(info) if info else ("", {})
-        url, headers = await loop.run_in_executor(None, _fetch)
+                return _extract_stream(info) if info else ("", {}, 0.0)
+        url, headers, expires_at = await loop.run_in_executor(None, _fetch)
         if url:
             next_track.stream_url   = url
             next_track.http_headers = headers
             next_track.fetched_at   = time.monotonic()
+            next_track.stream_expires_at = expires_at
             print(f"[Prefetch] ✓ Pre-fetched stream for '{next_track.title}'")
     except Exception as e:
         print(f"[Prefetch] Failed for '{next_track.title}': {e}")
 
 
-async def _play_next(guild: discord.Guild) -> None:
+async def _play_next(guild: discord.Guild, playback_id: Optional[int] = None,
+                     playback_error: str = "", force_advance: bool = False,
+                     intentional_advance: bool = False,
+                     expected_current: Optional[Track] = None,
+                     expected_transition: Optional[int] = None) -> None:
     """Advance the queue to the next track.
     Protected by a per-guild lock to prevent race conditions."""
     lock = get_play_lock(guild.id)
-    if lock.locked():
-        return
     async with lock:
         q = queues.get(guild.id)
         if q is None:
             return
+        if expected_current is not None and (
+            q.current is not expected_current
+            or q.transition_id != expected_transition
+        ):
+            print("[Player] Ignoring obsolete forced advance")
+            return
 
-        # Was this stop intentional (skip/skipto/back/seek/effect change)?
-        # Capture and clear up-front so the flag can't go stale across the
-        # early-return paths below.
-        manual_stop_was = q.manual_stop
-        q.manual_stop   = False
+        # Ignore callbacks from an old source. Waiting for the lock rather than
+        # dropping transitions makes rapid command sequences deterministic.
+        if playback_id is not None and playback_id != q.playback_id:
+            q.manual_stop_ids.discard(playback_id)
+            print(f"[Player:{playback_id}] Ignoring stale callback; "
+                  f"active source is {q.playback_id}")
+            return
+
+        manual_stop_was = (
+            playback_id is not None and playback_id in q.manual_stop_ids
+        ) or intentional_advance
+        if playback_id is not None:
+            q.manual_stop_ids.discard(playback_id)
+        q.manual_stop_ids = {
+            source_id for source_id in q.manual_stop_ids
+            if source_id >= q.playback_id - 8
+        }
 
         # Honour seek/restart requests
         if q.restart_current:
@@ -1567,33 +1816,35 @@ async def _play_next(guild: discord.Guild) -> None:
             await _start_playing(guild, q, seek_secs=seek)
             return
 
-        # Loop current song
-        if q.loop_mode == "song" and q.current:
-            await _start_playing(guild, q)
-            return
-
         # ── Premature stream-failure detection ───────────────────────────────
         # When a stream URL dies mid-song, FFmpeg often exits *cleanly*, so this
         # callback fires as if the song finished — manifesting as a random skip.
         # If the track ended well before its real duration and wasn't skipped,
         # re-resolve a fresh stream URL and resume from where it cut out.
         cur = q.current
-        if (cur and not manual_stop_was and cur.duration_secs and q.play_start
-                and cur.retry_count < 2):
-            played = time.monotonic() - q.play_start
-            if q.paused_at:
-                played -= (time.monotonic() - q.paused_at)
-            played = max(0, played)
-            ended_early = (played < cur.duration_secs - 15
-                           and played < cur.duration_secs * 0.95)
-            if ended_early:
+        played = _playback_position(q)
+        ended_early = bool(
+            cur and cur.duration_secs and q.play_start is not None
+            and played < cur.duration_secs - 10
+            and played < cur.duration_secs * 0.97
+        )
+        stream_failed = bool(playback_error) or ended_early
+        exhausted_failure = False
+        if (cur and not force_advance and not manual_stop_was and stream_failed):
+            if cur.retry_count < MAX_STREAM_RETRIES:
                 cur.retry_count += 1
                 cur.stream_url   = ""          # force a fresh resolve
+                cur.http_headers = {}
+                cur.stream_expires_at = 0
                 cur.fetched_at   = 0
-                resume_at = int(max(0, played - 3))
-                print(f"[Player] '{cur.title}' ended early "
-                      f"({int(played)}s/{cur.duration_secs}s) — retry "
-                      f"#{cur.retry_count} from {resume_at}s")
+                resume_at = max(0, played - 1)
+                delay = (0.5, 1.5, 3.0)[cur.retry_count - 1]
+                reason = playback_error or (
+                    f"clean early exit at {played}s/{cur.duration_secs}s"
+                )
+                print(f"[Player:{q.playback_id}] '{cur.title}' failed ({reason}) — "
+                      f"retry {cur.retry_count}/{MAX_STREAM_RETRIES} "
+                      f"from {resume_at}s in {delay:.1f}s")
                 if q.text_channel:
                     try:
                         await q.text_channel.send(
@@ -1602,24 +1853,57 @@ async def _play_next(guild: discord.Guild) -> None:
                         )
                     except Exception:
                         pass
+                recovery_transition = q.transition_id
+                await asyncio.sleep(delay)
+                if queues.get(guild.id) is not q or q.current is not cur:
+                    print(f"[Player:{q.playback_id}] Recovery cancelled; track changed")
+                    return
+                if q.transition_id != recovery_transition:
+                    if q.restart_current:
+                        q.restart_current = False
+                        requested_seek = q.seek_to
+                        q.seek_to = 0
+                        print(f"[Player:{q.playback_id}] Recovery superseded by "
+                              f"requested restart at {requested_seek}s")
+                        await _start_playing(guild, q, seek_secs=requested_seek)
+                    else:
+                        print(f"[Player:{q.playback_id}] Recovery cancelled by user action")
+                    return
                 await _start_playing(guild, q, seek_secs=resume_at)
                 return
+            exhausted_failure = True
+            print(f"[Player:{q.playback_id}] Recovery exhausted for '{cur.title}'")
+            if q.text_channel:
+                try:
+                    await q.text_channel.send(
+                        f"⚠️ **{cur.title}** kept losing its audio stream, "
+                        "so I moved to the next song."
+                    )
+                except Exception:
+                    pass
+
+        # Loop only after a genuine natural completion. A manual skip or failed
+        # stream must never trap the queue on the same song.
+        if (q.loop_mode == "song" and q.current and not manual_stop_was
+                and not stream_failed and not force_advance):
+            q.current.retry_count = 0
+            await _start_playing(guild, q)
+            return
 
         # Archive finished track and accumulate session listening time
-        if q.current:
+        if q.current and not exhausted_failure and not force_advance:
+            q.current.retry_count = 0
             q.history.append(q.current)
             q.songs_played += 1
-            if q.play_start:
-                listened = int(time.monotonic() - q.play_start)
-                if q.paused_at:
-                    listened -= int(time.monotonic() - q.paused_at)
-                listened = max(0, listened)
+            if q.play_start is not None:
+                listened = int(_active_playback_seconds(q))
                 if q.current.duration_secs:
                     listened = min(listened, q.current.duration_secs)
                 q.session_listen_secs += listened
 
         # Loop queue
-        if q.loop_mode == "queue" and q.current:
+        if (q.loop_mode == "queue" and q.current
+                and not exhausted_failure and not force_advance):
             q.tracks.append(q.current)
 
         # Queue exhausted — try autoplay before giving up
@@ -1675,16 +1959,17 @@ async def _handle_voice_drop(guild: discord.Guild) -> None:
         print(f"[Voice] Drop ignored in {guild.name} — reconnect already in progress")
         return
     q.reconnecting = True
+    was_paused = bool(
+        (q.voice_client and q.voice_client.is_paused())
+        or q.paused_at is not None
+    )
+    q.pause_after_restart = was_paused
+    # Invalidate the disconnected source immediately. Its late callback must
+    # not advance the queue while reconnect work is in progress.
+    q.playback_id += 1
 
     channel = q.voice_client.channel if q.voice_client else None
-    now     = time.monotonic()
-    elapsed = int(now - q.play_start) if q.play_start else 0
-    # Subtract time the player was paused so we resume at the right position
-    if q.paused_at:
-        elapsed -= int(now - q.paused_at)
-    elapsed = max(0, elapsed)
-    if q.current and q.current.duration_secs:
-        elapsed = min(elapsed, q.current.duration_secs)
+    elapsed = _playback_position(q)
 
     print(f"[Voice] Drop detected in {guild.name} — attempting reconnect")
     _cancel_np_tasks(q)
@@ -1694,8 +1979,8 @@ async def _handle_voice_drop(guild: discord.Guild) -> None:
 
     reconnected = False
     try:
-        for attempt in range(1, 4):
-            await asyncio.sleep(5 * attempt)
+        for attempt, delay in enumerate((1.0, 3.0, 7.0), start=1):
+            await asyncio.sleep(delay)
             # Re-fetch q in case it was cleaned up while we waited
             q = queues.get(guild.id)
             if not q:
@@ -1719,8 +2004,7 @@ async def _handle_voice_drop(guild: discord.Guild) -> None:
                 print(f"[Voice] Reconnect attempt {attempt} failed: {e}")
 
         if reconnected and q.current:
-            q.restart_current = True
-            q.seek_to         = elapsed
+            _request_restart(q, elapsed)
             asyncio.create_task(_play_next(guild))
             if q.text_channel:
                 try:
@@ -1728,12 +2012,13 @@ async def _handle_voice_drop(guild: discord.Guild) -> None:
                 except Exception:
                     pass
         else:
-            q.current    = None
-            q.play_start = None
             asyncio.create_task(_update_presence(None))
             if q.text_channel:
                 try:
-                    await q.text_channel.send("⚠️ Voice connection lost. Use `/play` to resume.")
+                    await q.text_channel.send(
+                        "⚠️ Voice connection is still unavailable. I kept the "
+                        "current song and queue; use `/play` after voice recovers."
+                    )
                 except Exception:
                     pass
     finally:
@@ -1847,9 +2132,8 @@ class MusicBot(commands.Bot):
                 q.idle_task.cancel()
                 q.idle_task = None
             if vc.is_paused():
+                _resume_playback_clock(q)
                 vc.resume()
-                if q.paused_at is not None:
-                    q.paused_at = None
             if q.text_channel:
                 try:
                     await q.text_channel.send(
@@ -2086,8 +2370,17 @@ async def ensure_voice(interaction: discord.Interaction) -> Optional[GuildQueue]
             q.idle_task.cancel()
             q.idle_task = None
         if q.voice_client.is_paused():
+            _resume_playback_clock(q)
             q.voice_client.resume()
-            q.paused_at = None
+
+    # A failed reconnect preserves the current song. Once a later /play call
+    # reconnects voice, resume that song before queueing the new request.
+    if (q.current and q.voice_client and q.voice_client.is_connected()
+            and not q.voice_client.is_playing()
+            and not q.voice_client.is_paused()
+            and not q.reconnecting):
+        _request_restart(q, _playback_position(q))
+        asyncio.create_task(_play_next(interaction.guild))
 
     return q
 
@@ -2423,8 +2716,7 @@ async def cmd_skip(interaction: discord.Interaction):
         return await interaction.response.send_message("❌ Join my voice channel first.", ephemeral=True)
     if has_dj_role(interaction.user):
         q.vote_skip_users.clear()
-        q.manual_stop = True
-        q.voice_client.stop()
+        _stop_for_transition(q)
         return await interaction.response.send_message("⏭️ Skipped.")
     listeners = [m for m in q.voice_client.channel.members if not m.bot]
     needed    = max(1, math.ceil(len(listeners) / 2))
@@ -2434,8 +2726,7 @@ async def cmd_skip(interaction: discord.Interaction):
     valid_votes = sum(1 for uid in q.vote_skip_users if any(m.id == uid for m in listeners))
     if valid_votes >= needed:
         q.vote_skip_users.clear()
-        q.manual_stop = True
-        q.voice_client.stop()
+        _stop_for_transition(q)
         await interaction.response.send_message(f"⏭️ Vote skip passed! ({valid_votes}/{needed})")
     else:
         await interaction.response.send_message(
@@ -2459,8 +2750,7 @@ async def cmd_skipto(interaction: discord.Interaction, position: int):
         q.history.append(t)
     q.tracks = deque(lst[position - 1:])
     if q.voice_client and (q.voice_client.is_playing() or q.voice_client.is_paused()):
-        q.manual_stop = True
-        q.voice_client.stop()
+        _stop_for_transition(q)
         await interaction.response.send_message(f"⏭️ Jumped to position **{position}**.")
     else:
         q.current = q.tracks.popleft()
@@ -2482,10 +2772,7 @@ async def cmd_seek(interaction: discord.Interaction, timestamp: str):
     dur = q.current.duration_secs or 0
     if dur and secs >= dur:
         return await interaction.response.send_message(f"❌ Song is only {q.current.duration} long.", ephemeral=True)
-    q.restart_current = True
-    q.seek_to         = secs
-    if q.voice_client and (q.voice_client.is_playing() or q.voice_client.is_paused()):
-        q.voice_client.stop()
+    _request_restart(q, secs)
     await interaction.response.send_message(f"⏩ Seeking to **{fmt_dur(secs)}**…")
 
 
@@ -2504,7 +2791,7 @@ async def cmd_stop(interaction: discord.Interaction):
     q.current         = None
     q.restart_current = False
     if q.voice_client.is_playing() or q.voice_client.is_paused():
-        q.voice_client.stop()
+        _stop_for_transition(q)
     await q.voice_client.disconnect()
     _cleanup_guild(interaction.guild_id)
     asyncio.create_task(_update_presence(None))
@@ -2530,9 +2817,7 @@ async def cmd_resume(interaction: discord.Interaction):
     q = queues.get(interaction.guild_id)
     if not q or not q.voice_client or not q.voice_client.is_paused():
         return await interaction.response.send_message("❌ Nothing is paused.", ephemeral=True)
-    if q.paused_at and q.play_start:
-        q.play_start += time.monotonic() - q.paused_at
-    q.paused_at = None
+    _resume_playback_clock(q)
     q.voice_client.resume()
     await interaction.response.send_message("▶️ Resumed.")
 
@@ -2544,10 +2829,7 @@ async def cmd_replay(interaction: discord.Interaction):
     q = queues.get(interaction.guild_id)
     if not q or not q.current:
         return await interaction.response.send_message("❌ Nothing is playing.", ephemeral=True)
-    q.restart_current = True
-    q.seek_to         = 0
-    if q.voice_client and (q.voice_client.is_playing() or q.voice_client.is_paused()):
-        q.voice_client.stop()
+    _request_restart(q, 0)
     await interaction.response.send_message("🔄 Restarting from the beginning.")
 
 
@@ -2676,22 +2958,24 @@ async def cmd_filter(interaction: discord.Interaction, preset: str):
     if not _same_vc(interaction, q):
         return await interaction.response.send_message("❌ Join my voice channel first.", ephemeral=True)
 
-    speed_reset_note = ""
+    elapsed = _playback_position(q)
+    reset_notes = []
     if preset != "off" and abs(q.speed - 1.0) > 0.01:
         q.speed          = 1.0
-        speed_reset_note = "\n⚠️ Your speed setting was reset to 1.0× (filters handle tempo internally)."
+        reset_notes.append("speed was reset to 1.0×")
+    if preset != "off" and q.eq_preset != "flat":
+        q.eq_preset = "flat"
+        reset_notes.append("EQ was reset to Flat")
 
     q.audio_filter = None if preset == "off" else preset
-    if q.voice_client and q.current and (q.voice_client.is_playing() or q.voice_client.is_paused()):
-        elapsed           = int(time.monotonic() - q.play_start) if q.play_start else 0
-        q.restart_current = True
-        q.seek_to         = elapsed
-        q.voice_client.stop()
+    if q.current:
+        _request_restart(q, elapsed)
     else:
         asyncio.create_task(_refresh_np_embed(q))
 
     label = "❌ Filter removed." if preset == "off" else f"✅ Filter set to **{preset}**."
-    await interaction.response.send_message(label + speed_reset_note)
+    note = f"\n⚠️ {' and '.join(reset_notes)} to keep playback stable." if reset_notes else ""
+    await interaction.response.send_message(label + note)
 
 
 @bot.tree.command(name="eq", description="Apply an equalizer preset (flat, bass, treble, pop, rock, jazz, classical)")
@@ -2713,12 +2997,16 @@ async def cmd_eq(interaction: discord.Interaction, preset: str):
         return await interaction.response.send_message("❌ Not connected.", ephemeral=True)
     if not _same_vc(interaction, q):
         return await interaction.response.send_message("❌ Join my voice channel first.", ephemeral=True)
+    if q.audio_filter and preset != "flat":
+        return await interaction.response.send_message(
+            "❌ Clear the current audio filter first (`/filter off`) before applying EQ. "
+            "Stacking both can make playback stutter on the Pi.",
+            ephemeral=True,
+        )
     q.eq_preset = preset
-    if q.voice_client and q.current and (q.voice_client.is_playing() or q.voice_client.is_paused()):
-        elapsed           = int(time.monotonic() - q.play_start) if q.play_start else 0
-        q.restart_current = True
-        q.seek_to         = elapsed
-        q.voice_client.stop()
+    if q.current:
+        elapsed           = _playback_position(q)
+        _request_restart(q, elapsed)
     else:
         asyncio.create_task(_refresh_np_embed(q))
     await interaction.response.send_message(f"🎚 EQ set to **{preset}**.")
@@ -2739,12 +3027,10 @@ async def cmd_speed(interaction: discord.Interaction, value: float):
     if q.audio_filter:
         return await interaction.response.send_message(
             "❌ Clear the current audio filter first (`/filter off`) before setting speed.", ephemeral=True)
+    elapsed = _playback_position(q)
     q.speed = value
-    if q.voice_client and q.current and (q.voice_client.is_playing() or q.voice_client.is_paused()):
-        elapsed           = int(time.monotonic() - q.play_start) if q.play_start else 0
-        q.restart_current = True
-        q.seek_to         = elapsed
-        q.voice_client.stop()
+    if q.current:
+        _request_restart(q, elapsed)
     else:
         asyncio.create_task(_refresh_np_embed(q))
     state = "✅ Speed reset to normal." if abs(value - 1.0) < 0.01 else f"⏩ Speed set to **{value:.2f}×**."
@@ -2772,13 +3058,9 @@ async def cmd_volume(interaction: discord.Interaction, level: Optional[int] = No
         return await interaction.response.send_message("❌ Volume must be between 1 and 100.", ephemeral=True)
     old      = q.volume
     q.volume = level / 100
-    if (q.voice_client and q.current
-            and (q.voice_client.is_playing() or q.voice_client.is_paused())
-            and abs(old - q.volume) > 0.005):
-        elapsed           = int(time.monotonic() - q.play_start) if q.play_start else 0
-        q.restart_current = True
-        q.seek_to         = elapsed
-        q.voice_client.stop()
+    if q.current and abs(old - q.volume) > 0.005:
+        elapsed           = _playback_position(q)
+        _request_restart(q, elapsed)
     await interaction.response.send_message(f"🔊 Volume set to **{level}%**.")
 
 
@@ -2791,12 +3073,16 @@ async def cmd_bass(interaction: discord.Interaction):
         return await interaction.response.send_message("❌ Not connected.", ephemeral=True)
     if not _same_vc(interaction, q):
         return await interaction.response.send_message("❌ Join my voice channel first.", ephemeral=True)
+    if q.audio_filter:
+        return await interaction.response.send_message(
+            "❌ Clear the current audio filter first (`/filter off`) before using bass boost. "
+            "Stacking both can make playback stutter on the Pi.",
+            ephemeral=True,
+        )
     q.bass_boost = not q.bass_boost
-    if q.voice_client and q.current and (q.voice_client.is_playing() or q.voice_client.is_paused()):
-        elapsed           = int(time.monotonic() - q.play_start) if q.play_start else 0
-        q.restart_current = True
-        q.seek_to         = elapsed
-        q.voice_client.stop()
+    if q.current:
+        elapsed           = _playback_position(q)
+        _request_restart(q, elapsed)
     else:
         asyncio.create_task(_refresh_np_embed(q))
     state = "🔊 **Bass boost ON**" if q.bass_boost else "🔈 **Bass boost OFF**"
@@ -2805,11 +3091,9 @@ async def cmd_bass(interaction: discord.Interaction):
 
 def _apply_filter_restart(q: GuildQueue) -> None:
     """Restart current playback from the current position so a new filter takes effect."""
-    if q.voice_client and q.current and (q.voice_client.is_playing() or q.voice_client.is_paused()):
-        elapsed           = int(time.monotonic() - q.play_start) if q.play_start else 0
-        q.restart_current = True
-        q.seek_to         = elapsed
-        q.voice_client.stop()
+    if q.current:
+        elapsed           = _playback_position(q)
+        _request_restart(q, elapsed)
     else:
         asyncio.create_task(_refresh_np_embed(q))
 
@@ -2992,8 +3276,7 @@ async def cmd_previous(interaction: discord.Interaction):
     if q.voice_client.is_playing() or q.voice_client.is_paused():
         # Route through the restart_current path so _play_next replays `prev`
         # directly instead of archiving it and advancing to the next track.
-        q.restart_current = True
-        q.voice_client.stop()
+        _request_restart(q, 0)
     else:
         q.restart_current = False
         await _start_playing(interaction.guild, q)
@@ -3355,7 +3638,7 @@ async def cmd_disconnect(interaction: discord.Interaction):
     q.current         = None
     q.restart_current = False
     if q.voice_client.is_playing() or q.voice_client.is_paused():
-        q.voice_client.stop()
+        _stop_for_transition(q)
     await q.voice_client.disconnect()
     _cleanup_guild(interaction.guild_id)
     asyncio.create_task(_update_presence(None))
@@ -3427,8 +3710,7 @@ async def cmd_back(interaction: discord.Interaction):
     if q.voice_client and (q.voice_client.is_playing() or q.voice_client.is_paused()):
         # Route through the restart_current path so _play_next replays `prev`
         # directly instead of archiving it and advancing to the next track.
-        q.restart_current = True
-        q.voice_client.stop()
+        _request_restart(q, 0)
         await interaction.response.send_message(f"⏮️ Going back to **{prev.title}**.")
     elif q.voice_client and q.voice_client.is_connected():
         q.restart_current = False
