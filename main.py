@@ -191,8 +191,6 @@ class GuildQueue:
     np_update_task:  Optional[asyncio.Task]        = None
     # Reconnect guard — prevents duplicate _handle_voice_drop tasks
     reconnecting:    bool                          = False
-    # Pre-fetch task — fetches next song's stream URL in the background
-    prefetch_task:      Optional[asyncio.Task]     = None
     # Accumulated playback time this session (seconds)
     session_listen_secs: int                       = 0
     # Auto-pause state — set when bot pauses because everyone left voice
@@ -609,7 +607,15 @@ async def fetch_track(query: str, requested_by: str,
 
     try:
         info = await asyncio.wait_for(loop.run_in_executor(None, _extract), timeout=20)
-        return _info_to_track(info, requested_by, requested_by_id)
+        track = _info_to_track(info, requested_by, requested_by_id)
+        # Keep the metadata, but do not retain the signed googlevideo URL from
+        # the search/request phase. YouTube may revoke or truncate that URL while
+        # the song waits in the queue. Resolve it just-in-time in _start_playing.
+        track.stream_url = ""
+        track.http_headers = {}
+        track.stream_expires_at = 0
+        track.fetched_at = 0
+        return track
     except asyncio.TimeoutError:
         print(f"[yt-dlp] Timed out: {target}")
         return None
@@ -1039,14 +1045,11 @@ async def _np_updater(guild_id: int, track: Track) -> None:
 
 
 def _cancel_np_tasks(q: GuildQueue) -> None:
-    """Cancel the live NP updater task, prefetch task, and clear the tracked message."""
+    """Cancel the live Now Playing updater and clear the tracked message."""
     if q.np_update_task and not q.np_update_task.done():
         q.np_update_task.cancel()
     q.np_update_task = None
     q.np_message     = None
-    if q.prefetch_task and not q.prefetch_task.done():
-        q.prefetch_task.cancel()
-    q.prefetch_task = None
 
 
 def _register_np(q: GuildQueue, msg: discord.Message, track: Track, guild_id: int) -> None:
@@ -1703,12 +1706,6 @@ async def _start_playing(guild: discord.Guild, q: GuildQueue,
     print(f"[Player:{playback_id}] ▶ {track.title} at {seek_secs}s")
     asyncio.create_task(_update_presence(track, is_playing=True))
 
-    # Pre-fetch the next song's stream URL in the background to reduce inter-track gap
-    if q.prefetch_task:
-        q.prefetch_task.cancel()
-    if q.tracks:
-        q.prefetch_task = asyncio.create_task(_prefetch_next(q))
-
     # Warn the channel if an expired stream URL was successfully re-fetched
     if stream_was_expired and q.text_channel and seek_secs == 0:
         try:
@@ -1740,35 +1737,6 @@ async def _start_playing(guild: discord.Guild, q: GuildQueue,
                 _register_np(q, msg, q.current, guild.id)
         except Exception as e:
             print(f"[Player] Could not send/edit Now Playing card: {e}")
-
-
-async def _prefetch_next(q: GuildQueue) -> None:
-    """After a short delay, pre-fetch the stream URL for the next queued track
-    so there's no gap when the current song ends."""
-    await asyncio.sleep(20)          # let the current song settle first
-    if not q.tracks:
-        return
-    next_track = q.tracks[0]
-    if next_track.stream_url:        # already fetched
-        return
-    try:
-        loop = asyncio.get_event_loop()
-        # Use the SAME hardened format as YDL_OPTS — otherwise prefetch caches a
-        # DASH stream URL that _resolve_stream trusts and plays, re-introducing
-        # the mid-song freezes the format fix was meant to eliminate.
-        def _fetch():
-            with yt_dlp.YoutubeDL(YDL_OPTS) as ydl:
-                info = ydl.extract_info(next_track.webpage_url, download=False)
-                return _extract_stream(info) if info else ("", {}, 0.0)
-        url, headers, expires_at = await loop.run_in_executor(None, _fetch)
-        if url:
-            next_track.stream_url   = url
-            next_track.http_headers = headers
-            next_track.fetched_at   = time.monotonic()
-            next_track.stream_expires_at = expires_at
-            print(f"[Prefetch] ✓ Pre-fetched stream for '{next_track.title}'")
-    except Exception as e:
-        print(f"[Prefetch] Failed for '{next_track.title}': {e}")
 
 
 async def _play_next(guild: discord.Guild, playback_id: Optional[int] = None,

@@ -137,6 +137,41 @@ class PlaybackTransitionTests(unittest.IsolatedAsyncioTestCase):
         bot._play_locks.clear()
         self.guild = Mock(id=123, name="Test guild")
 
+    async def test_fetch_track_keeps_metadata_but_resolves_stream_at_play_time(self):
+        info = {
+            "id": "video-id",
+            "title": "Queued song",
+            "webpage_url": "https://youtu.be/video-id",
+            "url": "https://media.example/early-signed-url",
+            "duration": 180,
+            "http_headers": {"User-Agent": "Extractor UA"},
+        }
+
+        class FakeYDL:
+            def __init__(self, _opts):
+                pass
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                pass
+
+            def extract_info(self, _target, download=False):
+                return info
+
+        with patch.object(bot.yt_dlp, "YoutubeDL", FakeYDL):
+            track = await bot.fetch_track("Queued song", "tester", 42)
+
+        self.assertIsInstance(track, bot.Track)
+        self.assertEqual(track.title, "Queued song")
+        self.assertEqual(track.duration_secs, 180)
+        self.assertEqual(track.webpage_url, "https://youtu.be/video-id")
+        self.assertEqual(track.stream_url, "")
+        self.assertEqual(track.http_headers, {})
+        self.assertEqual(track.stream_expires_at, 0)
+        self.assertEqual(track.fetched_at, 0)
+
     async def test_stale_callback_cannot_advance_active_source(self):
         current = make_track()
         q = bot.GuildQueue(current=current, playback_id=9)
